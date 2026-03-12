@@ -42,6 +42,47 @@ github_api_get() {
   fi
 }
 
+get_release_asset_urls() {
+  local tag="$1"
+  local api_url="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
+  local body
+  if ! body="$(github_api_get "$api_url" 2>/dev/null)"; then
+    echo "Release tag not found: ${REPO}@${tag}" >&2
+    echo "Create GitHub release and upload build artifacts first." >&2
+    return 1
+  fi
+
+  echo "$body" | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+ensure_release_assets() {
+  local tag="$1"
+  local arch="$2"
+  local expected_app expected_web urls
+  expected_app="tele-auto-go_${tag}_linux_${arch}.tar.gz"
+  expected_web="tele-auto-go-web_${tag}.tar.gz"
+
+  urls="$(get_release_asset_urls "$tag")" || return 1
+  if [[ -z "$urls" ]]; then
+    echo "No assets found in release ${tag}." >&2
+    echo "Expected assets:" >&2
+    echo "  - ${expected_app}" >&2
+    echo "  - ${expected_web}" >&2
+    return 1
+  fi
+
+  if ! echo "$urls" | grep -q "/${expected_app}$"; then
+    echo "Missing asset: ${expected_app}" >&2
+    echo "Please upload it to release ${tag}." >&2
+    return 1
+  fi
+  if ! echo "$urls" | grep -q "/${expected_web}$"; then
+    echo "Missing asset: ${expected_web}" >&2
+    echo "Please upload it to release ${tag}." >&2
+    return 1
+  fi
+}
+
 resolve_version() {
   if [[ "$VERSION" != "latest" ]]; then
     echo "$VERSION"
@@ -201,6 +242,9 @@ main() {
   echo "    repo: ${REPO}"
   echo "    version: ${release_tag}"
   echo "    arch: ${arch}"
+
+  echo "==> Checking release assets"
+  ensure_release_assets "$release_tag" "$arch"
 
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
