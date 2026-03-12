@@ -18,6 +18,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"tele-auto-go/internal/adminauth"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/control"
 	"tele-auto-go/internal/logging"
@@ -31,6 +32,7 @@ type apiServer struct {
 	logs         *logstream.Hub
 	frontendBase string
 	webDir       string
+	adminAuth    *adminauth.Manager
 
 	otpMu      sync.Mutex
 	otpByPhone map[string]otpState
@@ -52,18 +54,37 @@ func main() {
 	logs := logstream.NewHub(500)
 	logger := logging.NewWithHub(level, logs)
 	manager := control.NewManager(logger)
+	admin, err := adminauth.NewManager(adminauth.Config{
+		Username:      strings.TrimSpace(os.Getenv("ADMIN_USERNAME")),
+		PasswordHash:  strings.TrimSpace(os.Getenv("ADMIN_PASSWORD_HASH")),
+		PasswordSalt:  strings.TrimSpace(os.Getenv("ADMIN_PASSWORD_SALT")),
+		SessionSecret: strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET")),
+		SessionTTL:    time.Duration(readIntEnv("ADMIN_SESSION_TTL_HOURS", 24*7)) * time.Hour,
+		CookieSecure:  readBoolEnv("COOKIE_SECURE", false),
+	})
+	if err != nil {
+		logger.Error("invalid admin auth config", "error", err.Error())
+		os.Exit(1)
+	}
+
 	server := &apiServer{
 		logger:       logger,
 		manager:      manager,
 		logs:         logs,
 		frontendBase: strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")),
 		webDir:       readWebDir(),
+		adminAuth:    admin,
 		otpByPhone:   make(map[string]otpState),
 	}
 	if info, err := os.Stat(server.webDir); err == nil && info.IsDir() {
 		logger.Info("frontend web dir detected", "web_dir", server.webDir)
 	} else {
 		logger.Warn("frontend web dir not found; API-only mode", "web_dir", server.webDir)
+	}
+	if server.adminAuth.Enabled() {
+		logger.Info("admin auth enabled", "username", server.adminAuth.Username())
+	} else {
+		logger.Warn("admin auth is disabled; dashboard is open without login")
 	}
 
 	if err := manager.Start(); err != nil {
@@ -73,17 +94,20 @@ func main() {
 	port := readServerPort()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
-	mux.HandleFunc("/api/auth/status", server.handleAuthStatus)
-	mux.HandleFunc("/api/auth/login", server.handleLogin)
-	mux.HandleFunc("/api/auth/logout", server.handleLogout)
-	mux.HandleFunc("/api/service/status", server.handleServiceStatus)
-	mux.HandleFunc("/api/service/start", server.handleServiceStart)
-	mux.HandleFunc("/api/service/stop", server.handleServiceStop)
-	mux.HandleFunc("/api/service/restart", server.handleServiceRestart)
-	mux.HandleFunc("/api/settings", server.handleSettings)
-	mux.HandleFunc("/api/soul", server.handleSoul)
-	mux.HandleFunc("/api/logs", server.handleLogs)
-	mux.HandleFunc("/api/logs/stream", server.handleLogStream)
+	mux.HandleFunc("/api/admin/me", server.handleAdminMe)
+	mux.HandleFunc("/api/admin/login", server.handleAdminLogin)
+	mux.HandleFunc("/api/admin/logout", server.handleAdminLogout)
+	mux.HandleFunc("/api/auth/status", server.requireAdmin(server.handleAuthStatus))
+	mux.HandleFunc("/api/auth/login", server.requireAdmin(server.handleLogin))
+	mux.HandleFunc("/api/auth/logout", server.requireAdmin(server.handleLogout))
+	mux.HandleFunc("/api/service/status", server.requireAdmin(server.handleServiceStatus))
+	mux.HandleFunc("/api/service/start", server.requireAdmin(server.handleServiceStart))
+	mux.HandleFunc("/api/service/stop", server.requireAdmin(server.handleServiceStop))
+	mux.HandleFunc("/api/service/restart", server.requireAdmin(server.handleServiceRestart))
+	mux.HandleFunc("/api/settings", server.requireAdmin(server.handleSettings))
+	mux.HandleFunc("/api/soul", server.requireAdmin(server.handleSoul))
+	mux.HandleFunc("/api/logs", server.requireAdmin(server.handleLogs))
+	mux.HandleFunc("/api/logs/stream", server.requireAdmin(server.handleLogStream))
 	mux.HandleFunc("/", server.handleFrontend)
 
 	root := withCORS(server.frontendBase, mux)
@@ -107,6 +131,77 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 		"worker":    s.manager.Status(),
 	})
+}
+
+type adminLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (s *apiServer) handleAdminMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !s.adminAuth.Enabled() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configured":    false,
+			"authenticated": true,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"configured":    true,
+		"authenticated": s.isAdminAuthenticated(r),
+		"username":      s.adminAuth.Username(),
+	})
+}
+
+func (s *apiServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !s.adminAuth.Enabled() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"configured":    false,
+			"authenticated": true,
+		})
+		return
+	}
+
+	var req adminLoginRequest
+	if err := decodeJSON(r, &req); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if !s.adminAuth.VerifyCredentials(req.Username, req.Password) {
+		errorJSON(w, http.StatusUnauthorized, errors.New("invalid username or password"))
+		return
+	}
+
+	token, err := s.adminAuth.IssueToken()
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.adminAuth.SetCookie(w, token)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"configured":    true,
+		"authenticated": true,
+		"username":      s.adminAuth.Username(),
+	})
+}
+
+func (s *apiServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	s.adminAuth.ClearCookie(w)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *apiServer) handleFrontend(w http.ResponseWriter, r *http.Request) {
@@ -540,6 +635,27 @@ func (s *apiServer) handleLogStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *apiServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.isAdminAuthenticated(r) {
+			next(w, r)
+			return
+		}
+		errorJSON(w, http.StatusUnauthorized, errors.New("unauthorized"))
+	}
+}
+
+func (s *apiServer) isAdminAuthenticated(r *http.Request) bool {
+	if !s.adminAuth.Enabled() {
+		return true
+	}
+	token, err := s.adminAuth.TokenFromRequest(r)
+	if err != nil {
+		return false
+	}
+	return s.adminAuth.ValidateToken(token)
+}
+
 func writeSSE(w http.ResponseWriter, event string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -563,6 +679,7 @@ func withCORS(frontendBase string, next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -590,6 +707,26 @@ func readWebDir() string {
 		return raw
 	}
 	return "./web"
+}
+
+func readBoolEnv(name string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if raw == "" {
+		return fallback
+	}
+	return raw == "true" || raw == "1" || raw == "yes" || raw == "on"
+}
+
+func readIntEnv(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 func readDotEnv(path string) (map[string]string, error) {

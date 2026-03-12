@@ -123,6 +123,116 @@ resolve_cli_user_home() {
   echo "$target_home"
 }
 
+get_env_value() {
+  local key="$1"
+  local file="$2"
+  local line
+  line="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 || true)"
+  echo "${line#*=}"
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local file="$3"
+  local escaped
+  escaped="$(printf '%s' "$value" | sed -e 's/[\\/&]/\\&/g')"
+
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+    sed -i.bak -E "s|^${key}=.*|${key}=${escaped}|" "$file"
+    rm -f "${file}.bak"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+random_hex() {
+  local bytes="${1:-16}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+    return
+  fi
+  od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return
+  fi
+  echo "Missing sha256 command (sha256sum or shasum)." >&2
+  return 1
+}
+
+ensure_admin_credentials() {
+  local env_file="$1"
+  local username hash salt secret pass1 pass2
+
+  username="$(get_env_value ADMIN_USERNAME "$env_file")"
+  hash="$(get_env_value ADMIN_PASSWORD_HASH "$env_file")"
+  salt="$(get_env_value ADMIN_PASSWORD_SALT "$env_file")"
+  secret="$(get_env_value ADMIN_SESSION_SECRET "$env_file")"
+
+  if [[ -n "$username" && -n "$hash" && -n "$salt" && -n "$secret" ]]; then
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    echo "Admin credentials are missing in ${env_file}." >&2
+    echo "Please set ADMIN_USERNAME / ADMIN_PASSWORD_HASH / ADMIN_PASSWORD_SALT / ADMIN_SESSION_SECRET manually." >&2
+    return 1
+  fi
+
+  echo "==> Setup dashboard login"
+  while [[ -z "${username}" ]]; do
+    read -r -p "Admin username: " username
+    username="$(printf '%s' "$username" | xargs)"
+  done
+
+  while true; do
+    read -r -s -p "Admin password: " pass1
+    echo
+    read -r -s -p "Confirm password: " pass2
+    echo
+    if [[ -z "$pass1" ]]; then
+      echo "Password cannot be empty."
+      continue
+    fi
+    if [[ "$pass1" != "$pass2" ]]; then
+      echo "Passwords do not match. Try again."
+      continue
+    fi
+    break
+  done
+
+  if [[ -z "$salt" ]]; then
+    salt="$(random_hex 16)"
+  fi
+  if [[ -z "$secret" ]]; then
+    secret="$(random_hex 32)"
+  fi
+  hash="$(printf '%s' "${salt}:${pass1}" | sha256_hex)"
+
+  set_env_value ADMIN_USERNAME "$username" "$env_file"
+  set_env_value ADMIN_PASSWORD_SALT "$salt" "$env_file"
+  set_env_value ADMIN_PASSWORD_HASH "$hash" "$env_file"
+  set_env_value ADMIN_SESSION_SECRET "$secret" "$env_file"
+
+  if [[ -z "$(get_env_value ADMIN_SESSION_TTL_HOURS "$env_file")" ]]; then
+    set_env_value ADMIN_SESSION_TTL_HOURS "168" "$env_file"
+  fi
+  if [[ -z "$(get_env_value COOKIE_SECURE "$env_file")" ]]; then
+    set_env_value COOKIE_SECURE "false" "$env_file"
+  fi
+
+  chmod 600 "$env_file"
+  echo "==> Admin login configured in ${env_file}"
+}
+
 write_uninstall_script() {
   local cli_user_link="$1"
   cat > "$INSTALL_DIR/bin/uninstall.sh" <<UNINSTALL
@@ -238,7 +348,7 @@ main() {
   need_cmd systemctl
   need_cmd getent
 
-  local arch release_tag base_url app_tar web_tar cli_user_home cli_user_link
+  local arch release_tag base_url app_tar web_tar cli_user_home cli_user_link env_file
   arch="$(detect_arch)"
   release_tag="$(resolve_version)"
   base_url="https://github.com/${REPO}/releases/download/${release_tag}"
@@ -246,6 +356,7 @@ main() {
   web_tar="tele-auto-go-web_${release_tag}.tar.gz"
   cli_user_home="$(resolve_cli_user_home)"
   cli_user_link="${cli_user_home}/.local/bin/tele-auto"
+  env_file="$INSTALL_DIR/etc/tele-auto.env"
 
   echo "==> Installing ${APP_NAME}"
   echo "    repo: ${REPO}"
@@ -276,13 +387,13 @@ main() {
   write_uninstall_script "$cli_user_link"
   write_cli_script
 
-  if [[ ! -f "$INSTALL_DIR/etc/tele-auto.env" ]]; then
+  if [[ ! -f "$env_file" ]]; then
     if [[ -f "${TMP_DIR}/app/tele-auto.env.example" ]]; then
-      cp "${TMP_DIR}/app/tele-auto.env.example" "$INSTALL_DIR/etc/tele-auto.env"
+      cp "${TMP_DIR}/app/tele-auto.env.example" "$env_file"
     elif [[ -f "${TMP_DIR}/app/.env.example" ]]; then
-      cp "${TMP_DIR}/app/.env.example" "$INSTALL_DIR/etc/tele-auto.env"
+      cp "${TMP_DIR}/app/.env.example" "$env_file"
     else
-      cat > "$INSTALL_DIR/etc/tele-auto.env" <<ENV
+      cat > "$env_file" <<ENV
 CONTROL_PORT=3000
 PORT=3000
 LOG_LEVEL=info
@@ -299,8 +410,9 @@ SQLITE_PATH=./data/app.db
 SOUL_PROMPT_PATH=./SOUL.md
 ENV
     fi
-    echo "==> Created $INSTALL_DIR/etc/tele-auto.env (please edit required values)"
+    echo "==> Created $env_file (please edit required values)"
   fi
+  ensure_admin_credentials "$env_file"
 
   if [[ -f "${TMP_DIR}/app/tele-auto.service" ]]; then
     sed \

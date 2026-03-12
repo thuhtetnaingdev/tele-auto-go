@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   Square,
   Terminal,
+  UserCircle2,
   WandSparkles,
 } from 'lucide-react'
 
@@ -59,12 +60,17 @@ type LoginResponse = {
   alreadyLogged?: boolean
 }
 
+type AdminSession = {
+  configured: boolean
+  authenticated: boolean
+  username?: string
+}
+
 const API_BASE =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000')
 
 const ONBOARDING_REQUIRED_KEYS = ['TG_API_ID', 'TG_API_HASH', 'TG_PHONE', 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL']
-
 const MAIN_VISIBLE_SETTINGS = ['TG_PHONE', 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'AUTO_REPLY_ENABLED']
 
 const booleanSettingKeys = new Set(['AUTO_REPLY_ENABLED'])
@@ -82,6 +88,7 @@ const settingLabels: Record<string, string> = {
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
@@ -111,6 +118,10 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
 
+  const [adminSession, setAdminSession] = useState<AdminSession>({ configured: false, authenticated: true })
+  const [adminUsername, setAdminUsername] = useState('')
+  const [adminPassword, setAdminPassword] = useState('')
+
   const [authStatus, setAuthStatus] = useState<AuthStatus>({ authorized: false, configured: false })
   const [serviceStatus, setServiceStatus] = useState<ServiceStatus>({ running: false })
   const [settings, setSettings] = useState<SettingsResponse>({ keys: [], values: {} })
@@ -129,11 +140,28 @@ export default function App() {
 
   const needsConfig = requiredMissing.length > 0
   const needsAuth = !authStatus.authorized
-  const showOnboarding = !loading && (needsConfig || needsAuth)
+  const needsAppLogin = adminSession.configured && !adminSession.authenticated
+  const showOnboarding = !loading && !needsAppLogin && (needsConfig || needsAuth)
+
+  const handleRequestError = (err: unknown) => {
+    const text = (err as Error).message
+    if (text.toLowerCase().includes('unauthorized')) {
+      setAdminSession((prev) => ({ ...prev, authenticated: false }))
+    }
+    setMessage(text)
+  }
 
   const refreshState = async () => {
     setLoading(true)
     try {
+      const admin = await apiRequest<AdminSession>('/api/admin/me')
+      setAdminSession(admin)
+
+      if (admin.configured && !admin.authenticated) {
+        setLoading(false)
+        return
+      }
+
       const [auth, service, settingsData, soul, logPayload] = await Promise.all([
         apiRequest<AuthStatus>('/api/auth/status'),
         apiRequest<ServiceStatus>('/api/service/status'),
@@ -150,7 +178,7 @@ export default function App() {
         setPhone(settingsData.values.TG_PHONE)
       }
     } catch (err) {
-      setMessage((err as Error).message)
+      handleRequestError(err)
     } finally {
       setLoading(false)
     }
@@ -161,7 +189,11 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const eventSource = new EventSource(`${API_BASE}/api/logs/stream`)
+    if (adminSession.configured && !adminSession.authenticated) {
+      return
+    }
+
+    const eventSource = new EventSource(`${API_BASE}/api/logs/stream`, { withCredentials: true })
     eventSource.addEventListener('log', (event) => {
       const parsed = JSON.parse((event as MessageEvent).data) as LogEntry
       setLogs((prev) => {
@@ -176,7 +208,7 @@ export default function App() {
     return () => {
       eventSource.close()
     }
-  }, [])
+  }, [adminSession.configured, adminSession.authenticated])
 
   const runAction = async (runner: () => Promise<void>, successText: string) => {
     setBusy(true)
@@ -186,7 +218,7 @@ export default function App() {
       setMessage(successText)
       await refreshState()
     } catch (err) {
-      setMessage((err as Error).message)
+      handleRequestError(err)
     } finally {
       setBusy(false)
     }
@@ -226,7 +258,7 @@ export default function App() {
       }
       await refreshState()
     } catch (err) {
-      setMessage((err as Error).message)
+      handleRequestError(err)
     } finally {
       setBusy(false)
     }
@@ -258,11 +290,82 @@ export default function App() {
     }))
   }
 
+  const loginAdmin = async () => {
+    if (!adminUsername.trim() || !adminPassword) {
+      setMessage('Username and password are required.')
+      return
+    }
+
+    setBusy(true)
+    setMessage('')
+    try {
+      await apiRequest<{ ok: boolean }>('/api/admin/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: adminUsername, password: adminPassword }),
+      })
+      setAdminPassword('')
+      setMessage('Login successful.')
+      await refreshState()
+    } catch (err) {
+      handleRequestError(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const logoutAdmin = async () => {
+    await runAction(
+      () => apiRequest('/api/admin/logout', { method: 'POST' }).then(() => undefined),
+      'Signed out.',
+    )
+  }
+
   if (loading) {
     return (
       <main className="min-h-screen bg-background px-4 py-10 text-foreground">
         <div className="mx-auto max-w-5xl rounded-xl border border-border/60 bg-card p-6 text-sm text-muted-foreground">
           Loading control center...
+        </div>
+      </main>
+    )
+  }
+
+  if (needsAppLogin) {
+    return (
+      <main className="min-h-screen bg-background px-4 py-10 text-foreground">
+        <div className="mx-auto max-w-md space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <UserCircle2 className="size-5" /> Dashboard Login
+              </CardTitle>
+              <CardDescription>Sign in with admin username and password configured during installation.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="admin-username">Username</Label>
+                <Input id="admin-username" value={adminUsername} onChange={(event) => setAdminUsername(event.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="admin-password">Password</Label>
+                <Input
+                  id="admin-password"
+                  type="password"
+                  value={adminPassword}
+                  onChange={(event) => setAdminPassword(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      void loginAdmin()
+                    }
+                  }}
+                />
+              </div>
+              <Button onClick={() => void loginAdmin()} disabled={busy} className="w-full">
+                <ShieldCheck className="size-4" /> Sign In
+              </Button>
+              {message ? <p className="text-sm text-destructive">{message}</p> : null}
+            </CardContent>
+          </Card>
         </div>
       </main>
     )
@@ -291,7 +394,7 @@ export default function App() {
             <Card>
               <CardHeader>
                 <CardTitle>Step 1: Required Settings</CardTitle>
-                <CardDescription>Only essential values are shown. Advanced options are now fixed in application defaults.</CardDescription>
+                <CardDescription>Only essential values are shown. Advanced options are fixed in application defaults.</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4 md:grid-cols-2">
                 {ONBOARDING_REQUIRED_KEYS.map((key) => (
@@ -359,8 +462,12 @@ export default function App() {
                   <Button onClick={() => void verifyLogin()} disabled={busy || needsConfig}>
                     <ShieldCheck className="size-4" /> Verify Login
                   </Button>
-                  <Button variant="outline" onClick={() => void runAction(() => apiRequest('/api/auth/logout', { method: 'POST' }), 'Logged out')} disabled={busy || needsConfig}>
-                    <LogOut className="size-4" /> Logout
+                  <Button
+                    variant="outline"
+                    onClick={() => void runAction(() => apiRequest('/api/auth/logout', { method: 'POST' }), 'Telegram logged out')}
+                    disabled={busy || needsConfig}
+                  >
+                    <LogOut className="size-4" /> Telegram Logout
                   </Button>
                 </div>
                 {!authStatus.configured && authStatus.error ? <p className="text-xs text-destructive">{authStatus.error}</p> : null}
@@ -394,6 +501,7 @@ export default function App() {
                   <Activity className="mr-1 size-3" />
                   {serviceStatus.running ? `Worker Running (${formatUptime(serviceStatus.uptimeSec)})` : 'Worker Stopped'}
                 </Badge>
+                {adminSession.username ? <Badge variant="secondary">Signed in as {adminSession.username}</Badge> : null}
                 {serviceStatus.lastError ? <Badge variant="destructive">Last Error: {serviceStatus.lastError}</Badge> : null}
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
@@ -420,8 +528,8 @@ export default function App() {
                 >
                   <Square className="size-4" /> Stop
                 </Button>
-                <Button variant="outline" onClick={() => void runAction(() => apiRequest('/api/auth/logout', { method: 'POST' }), 'Logged out. Onboarding will appear.')} disabled={busy}>
-                  <LogOut className="size-4" /> Logout
+                <Button variant="outline" onClick={() => void logoutAdmin()} disabled={busy}>
+                  <LogOut className="size-4" /> Sign Out
                 </Button>
               </div>
               {message ? <p className="mt-3 text-sm text-primary">{message}</p> : null}

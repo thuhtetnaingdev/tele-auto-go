@@ -52,6 +52,9 @@ Default API address: `http://localhost:3000`
 ## Main API Endpoints
 
 - `GET /health`
+- `GET /api/admin/me`
+- `POST /api/admin/login`
+- `POST /api/admin/logout`
 - `GET /api/auth/status`
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
@@ -103,6 +106,9 @@ make build-control
 - `CONTROL_PORT` (optional): control API port override
 - `FRONTEND_ORIGIN` (optional): CORS origin (default `http://localhost:5173`)
 - `WEB_DIR` (optional): static frontend dir to serve (default `./web`)
+- `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_SALT`, `ADMIN_SESSION_SECRET`
+- `ADMIN_SESSION_TTL_HOURS` (default `168`)
+- `COOKIE_SECURE` (`true` when running behind HTTPS)
 
 ## Production CLI
 

@@ -32,6 +32,8 @@ This creates:
 REPO=thuhtetnaingdev/tele-auto-go VERSION=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/thuhtetnaingdev/tele-auto-go/main/deploy/install.sh)
 ```
 
+Installer will prompt for dashboard admin username/password and save hashed credentials in `/opt/tele-auto-go/etc/tele-auto.env`.
+
 After install, CLI commands are available:
 
 ```bash
@@ -72,6 +74,7 @@ Frontend runs on `http://localhost:5173` and talks to backend using `VITE_API_BA
 
 ## Features in UI
 
+- Dashboard login (admin username/password)
 - Onboarding-first setup (required settings -> OTP verify -> dashboard)
 - Worker start/stop/restart
 - Realtime logs stream

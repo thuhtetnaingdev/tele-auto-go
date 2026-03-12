@@ -22,6 +22,7 @@ If unset, frontend defaults to current origin (useful in production when backend
 
 ## Features
 
+- Dashboard login screen (admin username/password)
 - Onboarding-first flow (required settings then OTP verify)
 - Worker start/stop/restart controls
 - Realtime log stream panel (SSE)
