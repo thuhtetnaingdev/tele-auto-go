@@ -29,7 +29,7 @@ This creates:
 3. Install on Linux server in one command:
 
 ```bash
-REPO=<your-github-user>/<your-repo> VERSION=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/<your-github-user>/<your-repo>/main/deploy/install.sh)
+REPO=thuhtetnaingdev/tele-auto-go VERSION=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/thuhtetnaingdev/tele-auto-go/main/deploy/install.sh)
 ```
 
 After install, CLI commands are available:
