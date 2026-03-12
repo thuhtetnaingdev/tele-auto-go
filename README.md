@@ -55,7 +55,7 @@ tele-auto uninstall
 ```bash
 cd backend
 cp .env.example .env
-# fill required env values
+# fill required env values, including ADMIN_* dashboard login credentials
 make run-control
 ```
 
@@ -75,6 +75,7 @@ Frontend runs on `http://localhost:5173` and talks to backend using `VITE_API_BA
 ## Features in UI
 
 - Dashboard login (admin username/password)
+- Dashboard account security (change username/password)
 - Onboarding-first setup (required settings -> OTP verify -> dashboard)
 - Worker start/stop/restart
 - Realtime logs stream

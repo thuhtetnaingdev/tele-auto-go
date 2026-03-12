@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +35,7 @@ type apiServer struct {
 	frontendBase string
 	webDir       string
 	adminAuth    *adminauth.Manager
+	adminMu      sync.RWMutex
 
 	otpMu      sync.Mutex
 	otpByPhone map[string]otpState
@@ -81,11 +84,11 @@ func main() {
 	} else {
 		logger.Warn("frontend web dir not found; API-only mode", "web_dir", server.webDir)
 	}
-	if server.adminAuth.Enabled() {
-		logger.Info("admin auth enabled", "username", server.adminAuth.Username())
-	} else {
-		logger.Warn("admin auth is disabled; dashboard is open without login")
+	if !server.getAdminAuth().Enabled() {
+		logger.Error("admin auth is required but not configured", "hint", "set ADMIN_USERNAME, ADMIN_PASSWORD_HASH, ADMIN_PASSWORD_SALT, ADMIN_SESSION_SECRET")
+		os.Exit(1)
 	}
+	logger.Info("admin auth enabled", "username", server.getAdminAuth().Username())
 
 	if err := manager.Start(); err != nil {
 		logger.Warn("telegram worker did not auto-start", "error", err.Error())
@@ -97,6 +100,7 @@ func main() {
 	mux.HandleFunc("/api/admin/me", server.handleAdminMe)
 	mux.HandleFunc("/api/admin/login", server.handleAdminLogin)
 	mux.HandleFunc("/api/admin/logout", server.handleAdminLogout)
+	mux.HandleFunc("/api/admin/credentials", server.requireAdmin(server.handleAdminCredentials))
 	mux.HandleFunc("/api/auth/status", server.requireAdmin(server.handleAuthStatus))
 	mux.HandleFunc("/api/auth/login", server.requireAdmin(server.handleLogin))
 	mux.HandleFunc("/api/auth/logout", server.requireAdmin(server.handleLogout))
@@ -143,17 +147,18 @@ func (s *apiServer) handleAdminMe(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !s.adminAuth.Enabled() {
+	admin := s.getAdminAuth()
+	if !admin.Enabled() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"configured":    false,
-			"authenticated": true,
+			"authenticated": false,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured":    true,
 		"authenticated": s.isAdminAuthenticated(r),
-		"username":      s.adminAuth.Username(),
+		"username":      admin.Username(),
 	})
 }
 
@@ -162,12 +167,9 @@ func (s *apiServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !s.adminAuth.Enabled() {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":            true,
-			"configured":    false,
-			"authenticated": true,
-		})
+	admin := s.getAdminAuth()
+	if !admin.Enabled() {
+		errorJSON(w, http.StatusServiceUnavailable, errors.New("admin login is not configured on server"))
 		return
 	}
 
@@ -176,22 +178,22 @@ func (s *apiServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusBadRequest, err)
 		return
 	}
-	if !s.adminAuth.VerifyCredentials(req.Username, req.Password) {
+	if !admin.VerifyCredentials(req.Username, req.Password) {
 		errorJSON(w, http.StatusUnauthorized, errors.New("invalid username or password"))
 		return
 	}
 
-	token, err := s.adminAuth.IssueToken()
+	token, err := admin.IssueToken()
 	if err != nil {
 		errorJSON(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.adminAuth.SetCookie(w, token)
+	admin.SetCookie(w, token)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"configured":    true,
 		"authenticated": true,
-		"username":      s.adminAuth.Username(),
+		"username":      admin.Username(),
 	})
 }
 
@@ -200,8 +202,130 @@ func (s *apiServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	s.adminAuth.ClearCookie(w)
+	s.getAdminAuth().ClearCookie(w)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type updateAdminCredentialsRequest struct {
+	CurrentPassword string `json:"currentPassword"`
+	NewUsername     string `json:"newUsername"`
+	NewPassword     string `json:"newPassword"`
+}
+
+func (s *apiServer) handleAdminCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w)
+		return
+	}
+
+	admin := s.getAdminAuth()
+	if !admin.Enabled() {
+		errorJSON(w, http.StatusServiceUnavailable, errors.New("admin login is not configured on server"))
+		return
+	}
+
+	var req updateAdminCredentialsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	currentPassword := req.CurrentPassword
+	newUsername := strings.TrimSpace(req.NewUsername)
+	newPassword := req.NewPassword
+	currentUsername := admin.Username()
+
+	if strings.TrimSpace(currentPassword) == "" {
+		errorJSON(w, http.StatusBadRequest, errors.New("current password is required"))
+		return
+	}
+	if !admin.VerifyCredentials(currentUsername, currentPassword) {
+		errorJSON(w, http.StatusUnauthorized, errors.New("current password is incorrect"))
+		return
+	}
+	if newUsername == "" {
+		newUsername = currentUsername
+	}
+	if newUsername == currentUsername && strings.TrimSpace(newPassword) == "" {
+		errorJSON(w, http.StatusBadRequest, errors.New("provide new username or new password"))
+		return
+	}
+	if strings.TrimSpace(newPassword) != "" && len(newPassword) < 4 {
+		errorJSON(w, http.StatusBadRequest, errors.New("new password must be at least 4 characters"))
+		return
+	}
+
+	env, err := readDotEnv(".env")
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	newSalt := strings.TrimSpace(os.Getenv("ADMIN_PASSWORD_SALT"))
+	newHash := strings.TrimSpace(strings.ToLower(os.Getenv("ADMIN_PASSWORD_HASH")))
+	newSecret := strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET"))
+	if newSalt == "" {
+		newSalt, err = randomHex(16)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if newSecret == "" {
+		newSecret, err = randomHex(32)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if strings.TrimSpace(newPassword) != "" {
+		newSalt, err = randomHex(16)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		newHash = adminauth.HashPassword(newPassword, newSalt)
+		newSecret, err = randomHex(32) // rotate to invalidate old sessions
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	nextMgr, err := adminauth.NewManager(adminauth.Config{
+		Username:      newUsername,
+		PasswordHash:  newHash,
+		PasswordSalt:  newSalt,
+		SessionSecret: newSecret,
+		SessionTTL:    time.Duration(readIntEnv("ADMIN_SESSION_TTL_HOURS", 24*7)) * time.Hour,
+		CookieSecure:  readBoolEnv("COOKIE_SECURE", false),
+	})
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	env["ADMIN_USERNAME"] = newUsername
+	env["ADMIN_PASSWORD_HASH"] = newHash
+	env["ADMIN_PASSWORD_SALT"] = newSalt
+	env["ADMIN_SESSION_SECRET"] = newSecret
+	if err := godotenv.Write(env, ".env"); err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	_ = os.Setenv("ADMIN_USERNAME", newUsername)
+	_ = os.Setenv("ADMIN_PASSWORD_HASH", newHash)
+	_ = os.Setenv("ADMIN_PASSWORD_SALT", newSalt)
+	_ = os.Setenv("ADMIN_SESSION_SECRET", newSecret)
+
+	s.setAdminAuth(nextMgr)
+	nextMgr.ClearCookie(w)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"reloginRequired": true,
+		"username":        newUsername,
+	})
 }
 
 func (s *apiServer) handleFrontend(w http.ResponseWriter, r *http.Request) {
@@ -428,10 +552,10 @@ func (s *apiServer) handleServiceRestart(w http.ResponseWriter, r *http.Request)
 var allowedSettingKeys = []string{
 	"TG_API_ID",
 	"TG_API_HASH",
-	"TG_PHONE",
 	"OPENAI_BASE_URL",
 	"OPENAI_API_KEY",
 	"OPENAI_MODEL",
+	"AI_CONTEXT_MESSAGE_LIMIT",
 	"AUTO_REPLY_ENABLED",
 }
 
@@ -646,14 +770,38 @@ func (s *apiServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *apiServer) isAdminAuthenticated(r *http.Request) bool {
-	if !s.adminAuth.Enabled() {
-		return true
+	admin := s.getAdminAuth()
+	if !admin.Enabled() {
+		return false
 	}
-	token, err := s.adminAuth.TokenFromRequest(r)
+	token, err := admin.TokenFromRequest(r)
 	if err != nil {
 		return false
 	}
-	return s.adminAuth.ValidateToken(token)
+	return admin.ValidateToken(token)
+}
+
+func (s *apiServer) getAdminAuth() *adminauth.Manager {
+	s.adminMu.RLock()
+	defer s.adminMu.RUnlock()
+	return s.adminAuth
+}
+
+func (s *apiServer) setAdminAuth(next *adminauth.Manager) {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	s.adminAuth = next
+}
+
+func randomHex(numBytes int) (string, error) {
+	if numBytes <= 0 {
+		return "", errors.New("numBytes must be positive")
+	}
+	buf := make([]byte, numBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func writeSSE(w http.ResponseWriter, event string, payload any) error {

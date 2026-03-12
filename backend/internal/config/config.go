@@ -62,9 +62,8 @@ func LoadForApp() (Config, error) {
 		LogLevel:       getString("LOG_LEVEL", "info"),
 		SQLitePath:     getString("SQLITE_PATH", "./data/app.db"),
 		SoulPromptPath: getString("SOUL_PROMPT_PATH", "./SOUL.md"),
-		ContextLimit:   fixedContextLimit,
+		ContextLimit:   getPositiveInt("AI_CONTEXT_MESSAGE_LIMIT", fixedContextLimit),
 	}
-	_ = getInt("AI_CONTEXT_MESSAGE_LIMIT", fixedContextLimit) // kept for backward compatibility.
 
 	var err error
 	cfg.Telegram.APIID, err = getIntRequired("TG_API_ID")
@@ -156,6 +155,14 @@ func getInt(name string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func getPositiveInt(name string, fallback int) int {
+	v := getInt(name, fallback)
+	if v <= 0 {
 		return fallback
 	}
 	return v

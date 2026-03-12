@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Tele Auto</title>
+  <desc id="desc">Rounded chat bubble with lightning bolt for automation</desc>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>
+  <path d="M16 20a8 8 0 0 1 8-8h16a8 8 0 0 1 8 8v11a8 8 0 0 1-8 8h-9l-7 7a1 1 0 0 1-1.7-.7V39h-1.3a8 8 0 0 1-8-8V20Z" fill="#fff8ef" fill-opacity=".95"/>
+  <path d="M33.6 18.8 27 30.2h5.6l-2.1 9.4L37 28.3h-5.7l2.3-9.5Z" fill="#ea580c"/>
+  <circle cx="22" cy="25.5" r="2" fill="#14b8a6"/>
+  <circle cx="42" cy="25.5" r="2" fill="#14b8a6"/>
+</svg>

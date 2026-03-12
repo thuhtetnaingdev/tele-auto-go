@@ -27,6 +27,10 @@ Required values:
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD_HASH`
+- `ADMIN_PASSWORD_SALT`
+- `ADMIN_SESSION_SECRET`
 
 Optional values:
 - `TG_SESSION_FILE` (default `./data/session.json`)
@@ -55,6 +59,7 @@ Default API address: `http://localhost:3000`
 - `GET /api/admin/me`
 - `POST /api/admin/login`
 - `POST /api/admin/logout`
+- `PUT /api/admin/credentials`
 - `GET /api/auth/status`
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
@@ -87,7 +92,6 @@ Telegram often delivers OTP to the Telegram app first (not SMS).
 ## Fixed Defaults (Hardcoded)
 
 The following are fixed at application level and no longer editable in UI settings:
-- context limit = `20`
 - max tokens = `320`
 - private-only mode = `true`
 - ignore bots/groups/media-only = `true`
@@ -106,7 +110,8 @@ make build-control
 - `CONTROL_PORT` (optional): control API port override
 - `FRONTEND_ORIGIN` (optional): CORS origin (default `http://localhost:5173`)
 - `WEB_DIR` (optional): static frontend dir to serve (default `./web`)
-- `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_SALT`, `ADMIN_SESSION_SECRET`
+- `AI_CONTEXT_MESSAGE_LIMIT` (optional): conversation context message count (default `20`)
+- `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_SALT`, `ADMIN_SESSION_SECRET` (required)
 - `ADMIN_SESSION_TTL_HOURS` (default `168`)
 - `COOKIE_SECURE` (`true` when running behind HTTPS)
 
