@@ -8,6 +8,15 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/tele-auto-go}"
 SERVICE_NAME="${SERVICE_NAME:-tele-auto}"
 REPO="${REPO:-thuhtetnaingdev/tele-auto-go}"
 VERSION="${VERSION:-latest}"
+TMP_DIR=""
+
+cleanup() {
+  if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
+    rm -rf "${TMP_DIR}"
+  fi
+}
+
+trap cleanup EXIT
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }
@@ -229,7 +238,7 @@ main() {
   need_cmd systemctl
   need_cmd getent
 
-  local arch release_tag base_url app_tar web_tar tmp_dir cli_user_home cli_user_link
+  local arch release_tag base_url app_tar web_tar cli_user_home cli_user_link
   arch="$(detect_arch)"
   release_tag="$(resolve_version)"
   base_url="https://github.com/${REPO}/releases/download/${release_tag}"
@@ -246,15 +255,14 @@ main() {
   echo "==> Checking release assets"
   ensure_release_assets "$release_tag" "$arch"
 
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  TMP_DIR="$(mktemp -d)"
 
   echo "==> Downloading artifacts"
-  curl -fL "${base_url}/${app_tar}" -o "${tmp_dir}/${app_tar}"
-  curl -fL "${base_url}/${web_tar}" -o "${tmp_dir}/${web_tar}"
+  curl -fL "${base_url}/${app_tar}" -o "${TMP_DIR}/${app_tar}"
+  curl -fL "${base_url}/${web_tar}" -o "${TMP_DIR}/${web_tar}"
 
-  mkdir -p "${tmp_dir}/app"
-  tar -xzf "${tmp_dir}/${app_tar}" -C "${tmp_dir}/app"
+  mkdir -p "${TMP_DIR}/app"
+  tar -xzf "${TMP_DIR}/${app_tar}" -C "${TMP_DIR}/app"
 
   getent group "$APP_GROUP" >/dev/null 2>&1 || groupadd --system "$APP_GROUP"
   id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --gid "$APP_GROUP" --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$APP_USER"
@@ -262,17 +270,17 @@ main() {
   echo "==> Preparing directories"
   mkdir -p "$INSTALL_DIR"/bin "$INSTALL_DIR"/web "$INSTALL_DIR"/etc "$INSTALL_DIR"/data "$INSTALL_DIR"/logs
 
-  install -m 0755 "${tmp_dir}/app/bin/tele-auto-control" "$INSTALL_DIR/bin/tele-auto-control"
+  install -m 0755 "${TMP_DIR}/app/bin/tele-auto-control" "$INSTALL_DIR/bin/tele-auto-control"
   rm -rf "$INSTALL_DIR/web"/*
-  tar -xzf "${tmp_dir}/${web_tar}" -C "$INSTALL_DIR/web"
+  tar -xzf "${TMP_DIR}/${web_tar}" -C "$INSTALL_DIR/web"
   write_uninstall_script "$cli_user_link"
   write_cli_script
 
   if [[ ! -f "$INSTALL_DIR/etc/tele-auto.env" ]]; then
-    if [[ -f "${tmp_dir}/app/tele-auto.env.example" ]]; then
-      cp "${tmp_dir}/app/tele-auto.env.example" "$INSTALL_DIR/etc/tele-auto.env"
-    elif [[ -f "${tmp_dir}/app/.env.example" ]]; then
-      cp "${tmp_dir}/app/.env.example" "$INSTALL_DIR/etc/tele-auto.env"
+    if [[ -f "${TMP_DIR}/app/tele-auto.env.example" ]]; then
+      cp "${TMP_DIR}/app/tele-auto.env.example" "$INSTALL_DIR/etc/tele-auto.env"
+    elif [[ -f "${TMP_DIR}/app/.env.example" ]]; then
+      cp "${TMP_DIR}/app/.env.example" "$INSTALL_DIR/etc/tele-auto.env"
     else
       cat > "$INSTALL_DIR/etc/tele-auto.env" <<ENV
 CONTROL_PORT=3000
@@ -294,12 +302,12 @@ ENV
     echo "==> Created $INSTALL_DIR/etc/tele-auto.env (please edit required values)"
   fi
 
-  if [[ -f "${tmp_dir}/app/tele-auto.service" ]]; then
+  if [[ -f "${TMP_DIR}/app/tele-auto.service" ]]; then
     sed \
       -e "s|__APP_USER__|${APP_USER}|g" \
       -e "s|__APP_GROUP__|${APP_GROUP}|g" \
       -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
-      "${tmp_dir}/app/tele-auto.service" > "/etc/systemd/system/${SERVICE_NAME}.service"
+      "${TMP_DIR}/app/tele-auto.service" > "/etc/systemd/system/${SERVICE_NAME}.service"
   else
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<UNIT
 [Unit]
