@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,27 @@ type MessageRecord struct {
 
 type Store struct {
 	db *sql.DB
+}
+
+type GlobalVariable struct {
+	Key       string `json:"key"`
+	Type      string `json:"type"`
+	Value     string `json:"value"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+type OrchestrationRun struct {
+	ChatID           string
+	TriggerMessage   string
+	SelectedAgentID  string
+	RouterReason     string
+	RouterConfidence float64
+	ToolName         string
+	ToolStatus       string
+	Status           string
+	ErrorMessage     string
+	FinalReply       string
+	DurationMS       int64
 }
 
 func Open(path string) (*Store, error) {
@@ -76,12 +98,127 @@ CREATE TABLE IF NOT EXISTS auto_replies (
   created_at TEXT NOT NULL,
   sent_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS global_variables (
+  key TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS orchestration_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  trigger_message TEXT NOT NULL,
+  selected_agent_id TEXT,
+  router_reason TEXT,
+  router_confidence REAL,
+  tool_name TEXT,
+  tool_status TEXT,
+  status TEXT NOT NULL,
+  error_message TEXT,
+  final_reply TEXT,
+  duration_ms INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 `); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
 	return &Store{db: db}, nil
+}
+
+func (s *Store) UpsertGlobalVariables(ctx context.Context, vars []GlobalVariable) error {
+	if len(vars) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO global_variables(key, type, value, updated_at)
+VALUES(?,?,?,?)
+ON CONFLICT(key) DO UPDATE SET
+  type=excluded.type,
+  value=excluded.value,
+  updated_at=excluded.updated_at
+`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, v := range vars {
+		key := strings.TrimSpace(v.Key)
+		typ := strings.TrimSpace(strings.ToLower(v.Type))
+		if key == "" {
+			return fmt.Errorf("variable key is required")
+		}
+		if typ != "text" && typ != "secret" {
+			return fmt.Errorf("invalid variable type for %s: %s", key, typ)
+		}
+		if _, err := stmt.ExecContext(ctx, key, typ, v.Value, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListGlobalVariables(ctx context.Context) ([]GlobalVariable, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT key, type, value, updated_at
+FROM global_variables
+ORDER BY key ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []GlobalVariable{}
+	for rows.Next() {
+		var v GlobalVariable
+		if err := rows.Scan(&v.Key, &v.Type, &v.Value, &v.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) GlobalVariablesMap(ctx context.Context) (map[string]string, map[string]string, error) {
+	list, err := s.ListGlobalVariables(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	values := make(map[string]string, len(list))
+	types := make(map[string]string, len(list))
+	for _, v := range list {
+		values[v.Key] = v.Value
+		types[v.Key] = v.Type
+	}
+	return values, types, nil
+}
+
+func (s *Store) SaveOrchestrationRun(ctx context.Context, run OrchestrationRun) error {
+	if strings.TrimSpace(run.Status) == "" {
+		run.Status = "unknown"
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO orchestration_runs(
+  chat_id, trigger_message, selected_agent_id, router_reason, router_confidence,
+  tool_name, tool_status, status, error_message, final_reply, duration_ms, created_at
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+`, run.ChatID, run.TriggerMessage, run.SelectedAgentID, run.RouterReason, run.RouterConfidence, run.ToolName, run.ToolStatus, run.Status, run.ErrorMessage, run.FinalReply, run.DurationMS, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func (s *Store) Close() error {

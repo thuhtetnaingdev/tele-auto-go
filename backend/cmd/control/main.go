@@ -21,10 +21,12 @@ import (
 	"github.com/joho/godotenv"
 
 	"tele-auto-go/internal/adminauth"
+	"tele-auto-go/internal/agents"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/control"
 	"tele-auto-go/internal/logging"
 	"tele-auto-go/internal/logstream"
+	"tele-auto-go/internal/store"
 	"tele-auto-go/internal/tgauth"
 )
 
@@ -35,6 +37,8 @@ type apiServer struct {
 	frontendBase string
 	webDir       string
 	adminAuth    *adminauth.Manager
+	agentMgr     *agents.Manager
+	db           *store.Store
 	adminMu      sync.RWMutex
 
 	otpMu      sync.Mutex
@@ -79,6 +83,29 @@ func main() {
 		adminAuth:    admin,
 		otpByPhone:   make(map[string]otpState),
 	}
+	sqlitePath := strings.TrimSpace(os.Getenv("SQLITE_PATH"))
+	if sqlitePath == "" {
+		sqlitePath = "./data/app.db"
+	}
+	st, err := store.Open(sqlitePath)
+	if err != nil {
+		logger.Error("failed to open sqlite store", "error", err.Error())
+		os.Exit(1)
+	}
+	defer st.Close()
+	server.db = st
+
+	agentsDir := strings.TrimSpace(os.Getenv("AGENTS_DIR"))
+	if agentsDir == "" {
+		agentsDir = "./agents"
+	}
+	agentMgr, err := agents.NewManager(agentsDir, logger)
+	if err != nil {
+		logger.Error("failed to initialize agent manager", "error", err.Error())
+		os.Exit(1)
+	}
+	server.agentMgr = agentMgr
+
 	if info, err := os.Stat(server.webDir); err == nil && info.IsDir() {
 		logger.Info("frontend web dir detected", "web_dir", server.webDir)
 	} else {
@@ -109,6 +136,9 @@ func main() {
 	mux.HandleFunc("/api/service/stop", server.requireAdmin(server.handleServiceStop))
 	mux.HandleFunc("/api/service/restart", server.requireAdmin(server.handleServiceRestart))
 	mux.HandleFunc("/api/settings", server.requireAdmin(server.handleSettings))
+	mux.HandleFunc("/api/variables", server.requireAdmin(server.handleVariables))
+	mux.HandleFunc("/api/agents", server.requireAdmin(server.handleAgents))
+	mux.HandleFunc("/api/agents/", server.requireAdmin(server.handleAgentByID))
 	mux.HandleFunc("/api/soul", server.requireAdmin(server.handleSoul))
 	mux.HandleFunc("/api/logs", server.requireAdmin(server.handleLogs))
 	mux.HandleFunc("/api/logs/stream", server.requireAdmin(server.handleLogStream))
@@ -571,6 +601,22 @@ type updateSettingsRequest struct {
 	Values map[string]string `json:"values"`
 }
 
+type upsertVariablesRequest struct {
+	Values []store.GlobalVariable `json:"values"`
+}
+
+type upsertAgentRequest struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Intents     []string `json:"intents"`
+	Tools       []string `json:"tools"`
+	Variables   []string `json:"variables"`
+	Model       string   `json:"model"`
+	Temperature float64  `json:"temperature"`
+	Body        string   `json:"body"`
+}
+
 func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -629,6 +675,144 @@ func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"restarted": restarted,
 			"values":    pickAllowedValues(env),
 		})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleVariables(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		values, err := s.db.ListGlobalVariables(r.Context())
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		masked := make([]map[string]any, 0, len(values))
+		for _, v := range values {
+			item := map[string]any{
+				"key":       v.Key,
+				"type":      v.Type,
+				"updatedAt": v.UpdatedAt,
+			}
+			if strings.ToLower(v.Type) == "secret" {
+				item["value"] = "********"
+				item["masked"] = true
+			} else {
+				item["value"] = v.Value
+				item["masked"] = false
+			}
+			masked = append(masked, item)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"values": masked})
+	case http.MethodPut:
+		var req upsertVariablesRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if len(req.Values) == 0 {
+			errorJSON(w, http.StatusBadRequest, errors.New("values payload is required"))
+			return
+		}
+		for i := range req.Values {
+			req.Values[i].Key = strings.TrimSpace(strings.ToUpper(req.Values[i].Key))
+			req.Values[i].Type = strings.TrimSpace(strings.ToLower(req.Values[i].Type))
+		}
+		if err := s.db.UpsertGlobalVariables(r.Context(), req.Values); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleAgents(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"agents": s.agentMgr.List()})
+	case http.MethodPost:
+		var req upsertAgentRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		agent, err := s.agentMgr.Upsert(agents.UpsertAgentInput{
+			ID:          req.ID,
+			Name:        req.Name,
+			Description: req.Description,
+			Intents:     req.Intents,
+			Tools:       req.Tools,
+			Variables:   req.Variables,
+			Model:       req.Model,
+			Temperature: req.Temperature,
+			Body:        req.Body,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/agents/"))
+	if id == "" || strings.Contains(id, "/") {
+		errorJSON(w, http.StatusNotFound, errors.New("agent not found"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		agent, ok := s.agentMgr.Get(id)
+		if !ok {
+			errorJSON(w, http.StatusNotFound, errors.New("agent not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"agent": agent})
+	case http.MethodPut:
+		var req upsertAgentRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if strings.TrimSpace(req.ID) == "" {
+			req.ID = id
+		}
+		if strings.TrimSpace(req.ID) != id {
+			errorJSON(w, http.StatusBadRequest, errors.New("id mismatch"))
+			return
+		}
+		agent, err := s.agentMgr.Upsert(agents.UpsertAgentInput{
+			ID:          req.ID,
+			Name:        req.Name,
+			Description: req.Description,
+			Intents:     req.Intents,
+			Tools:       req.Tools,
+			Variables:   req.Variables,
+			Model:       req.Model,
+			Temperature: req.Temperature,
+			Body:        req.Body,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent})
+	case http.MethodDelete:
+		if err := s.agentMgr.Delete(id); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				errorJSON(w, http.StatusNotFound, err)
+				return
+			}
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	default:
 		methodNotAllowed(w)
 	}
@@ -825,7 +1009,7 @@ func withCORS(frontendBase string, next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		if r.Method == http.MethodOptions {

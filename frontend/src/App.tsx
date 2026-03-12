@@ -74,6 +74,28 @@ type AdminSession = {
   username?: string
 }
 
+type AgentDefinition = {
+  id: string
+  name: string
+  description: string
+  intents: string[]
+  tools: string[]
+  variables: string[]
+  model?: string
+  temperature?: number
+  body: string
+  markdown?: string
+  updatedAt?: string
+}
+
+type VariableValue = {
+  key: string
+  type: 'text' | 'secret'
+  value: string
+  masked?: boolean
+  updatedAt?: string
+}
+
 const API_BASE_RAW = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
 const API_BASE = API_BASE_RAW ? API_BASE_RAW.replace(/\/+$/, '') : ''
 
@@ -183,6 +205,24 @@ export default function App() {
   const [password, setPassword] = useState('')
 
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [logMode, setLogMode] = useState<'all' | 'orchestrator'>('all')
+
+  const [agents, setAgents] = useState<AgentDefinition[]>([])
+  const [editingAgentID, setEditingAgentID] = useState('')
+  const [agentForm, setAgentForm] = useState<AgentDefinition>({
+    id: '',
+    name: '',
+    description: '',
+    intents: [],
+    tools: ['api_call'],
+    variables: [],
+    model: '',
+    temperature: 0.35,
+    body: '',
+  })
+
+  const [variables, setVariables] = useState<VariableValue[]>([])
+  const [variableForm, setVariableForm] = useState<VariableValue>({ key: '', type: 'text', value: '' })
 
   const settingsValues = settings && settings.values && typeof settings.values === 'object' ? settings.values : {}
   const settingsKeys = settings && Array.isArray(settings.keys) ? settings.keys : []
@@ -221,12 +261,14 @@ export default function App() {
         return
       }
 
-      const [auth, service, settingsData, soul, logPayload] = await Promise.all([
+      const [auth, service, settingsData, soul, logPayload, agentsPayload, varsPayload] = await Promise.all([
         apiRequest<AuthStatus>('/api/auth/status'),
         apiRequest<ServiceStatus>('/api/service/status'),
         apiRequest<SettingsResponse>('/api/settings'),
         apiRequest<{ content: string }>('/api/soul'),
         apiRequest<{ logs: LogEntry[] }>('/api/logs?limit=200'),
+        apiRequest<{ agents: AgentDefinition[] }>('/api/agents'),
+        apiRequest<{ values: VariableValue[] }>('/api/variables'),
       ])
       setAuthStatus(auth)
       setServiceStatus(service)
@@ -235,6 +277,8 @@ export default function App() {
       setSoulText(soul.content || '')
       setSoulLoadedAt(new Date().toISOString())
       setLogs(logPayload.logs || [])
+      setAgents(agentsPayload.agents || [])
+      setVariables(varsPayload.values || [])
     } catch (err) {
       handleRequestError(err)
     } finally {
@@ -397,6 +441,103 @@ export default function App() {
       },
     }))
   }
+
+  const resetAgentForm = () => {
+    setEditingAgentID('')
+    setAgentForm({
+      id: '',
+      name: '',
+      description: '',
+      intents: [],
+      tools: ['api_call'],
+      variables: [],
+      model: '',
+      temperature: 0.35,
+      body: '',
+    })
+  }
+
+  const startEditAgent = (agent: AgentDefinition) => {
+    setEditingAgentID(agent.id)
+    setAgentForm({
+      ...agent,
+      intents: agent.intents || [],
+      tools: ['api_call'],
+      variables: agent.variables || [],
+      body: agent.body || '',
+      temperature: agent.temperature || 0.35,
+    })
+  }
+
+  const saveAgent = async () => {
+    if (!agentForm.id.trim() || !agentForm.name.trim() || !agentForm.body.trim()) {
+      setMessage('Agent id, name, and body are required.')
+      return
+    }
+    const payload = {
+      ...agentForm,
+      id: agentForm.id.trim(),
+      name: agentForm.name.trim(),
+      description: agentForm.description.trim(),
+      intents: agentForm.intents,
+      tools: ['api_call'],
+      variables: agentForm.variables,
+      model: (agentForm.model || '').trim(),
+      body: agentForm.body.trim(),
+      temperature: Number(agentForm.temperature || 0.35),
+    }
+    const isEdit = editingAgentID === payload.id
+    const path = isEdit ? `/api/agents/${payload.id}` : '/api/agents'
+    const method = isEdit ? 'PUT' : 'POST'
+    await runAction(
+      () => apiRequest(path, { method, body: JSON.stringify(payload) }).then(() => undefined),
+      isEdit ? 'Agent updated' : 'Agent created',
+    )
+    resetAgentForm()
+  }
+
+  const deleteAgent = async (id: string) => {
+    await runConfirmedAction(
+      `Delete agent "${id}"?`,
+      () => apiRequest(`/api/agents/${id}`, { method: 'DELETE' }).then(() => undefined),
+      'Agent deleted',
+    )
+    if (editingAgentID === id) {
+      resetAgentForm()
+    }
+  }
+
+  const saveVariable = async () => {
+    const key = variableForm.key.trim().toUpperCase()
+    if (!key) {
+      setMessage('Variable key is required.')
+      return
+    }
+    if (!/^[A-Z0-9_]{2,64}$/.test(key)) {
+      setMessage('Variable key must match A-Z, 0-9, _ and be 2-64 chars.')
+      return
+    }
+    if (!variableForm.value.trim()) {
+      setMessage('Variable value is required.')
+      return
+    }
+    await runAction(
+      () =>
+        apiRequest('/api/variables', {
+          method: 'PUT',
+          body: JSON.stringify({
+            values: [{ key, type: variableForm.type, value: variableForm.value }],
+          }),
+        }).then(() => undefined),
+      'Variable saved',
+    )
+    setVariableForm({ key: '', type: 'text', value: '' })
+  }
+
+  const filteredLogs = useMemo(() => {
+    if (logMode === 'all') return logs
+    return logs.filter((entry) => `${entry.message} ${JSON.stringify(entry.attrs || {})}`.toLowerCase().includes('orchestrator'))
+  }, [logs, logMode])
 
   const loginAdmin = async () => {
     if (!adminUsername.trim() || !adminPassword) {
@@ -836,16 +977,162 @@ export default function App() {
                   </Card>
                 </section>
 
+                <section className="grid gap-6 lg:grid-cols-2">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>Global Variables</CardTitle>
+                      <CardDescription>Typed variables (`text`, `secret`) for agent interpolation and api_call tool.</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      <div className="grid gap-2 md:grid-cols-3">
+                        <Input
+                          placeholder="KEY_NAME"
+                          value={variableForm.key}
+                          onChange={(event) => setVariableForm((prev) => ({ ...prev, key: event.target.value }))}
+                          className="h-9"
+                        />
+                        <select
+                          className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                          value={variableForm.type}
+                          onChange={(event) => setVariableForm((prev) => ({ ...prev, type: event.target.value as 'text' | 'secret' }))}
+                        >
+                          <option value="text">text</option>
+                          <option value="secret">secret</option>
+                        </select>
+                        <Input
+                          type={variableForm.type === 'secret' ? 'password' : 'text'}
+                          placeholder="value"
+                          value={variableForm.value}
+                          onChange={(event) => setVariableForm((prev) => ({ ...prev, value: event.target.value }))}
+                          className="h-9"
+                        />
+                      </div>
+                      <Button size="sm" onClick={() => void saveVariable()} disabled={busy}>
+                        <Save className="size-4" /> Save Variable
+                      </Button>
+                      <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                        {variables.map((v) => (
+                          <div key={v.key} className="flex items-center justify-between border-b border-border/40 py-1 last:border-b-0">
+                            <div className="min-w-0">
+                              <p className="font-medium">{v.key}</p>
+                              <p className="text-xs text-muted-foreground">
+                                {v.type} • {v.value}
+                              </p>
+                            </div>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => setVariableForm({ key: v.key, type: v.type, value: '' })}
+                            >
+                              Edit
+                            </Button>
+                          </div>
+                        ))}
+                        {variables.length === 0 ? <p className="text-xs text-muted-foreground">No variables yet.</p> : null}
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>Agents</CardTitle>
+                      <CardDescription>Create Markdown-based agents with frontmatter metadata.</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      <div className="grid gap-2 md:grid-cols-2">
+                        <Input
+                          placeholder="id (e.g. price_agent)"
+                          value={agentForm.id}
+                          disabled={Boolean(editingAgentID)}
+                          onChange={(event) => setAgentForm((prev) => ({ ...prev, id: event.target.value }))}
+                          className="h-9"
+                        />
+                        <Input
+                          placeholder="name"
+                          value={agentForm.name}
+                          onChange={(event) => setAgentForm((prev) => ({ ...prev, name: event.target.value }))}
+                          className="h-9"
+                        />
+                        <Input
+                          placeholder="description"
+                          value={agentForm.description}
+                          onChange={(event) => setAgentForm((prev) => ({ ...prev, description: event.target.value }))}
+                          className="h-9 md:col-span-2"
+                        />
+                        <Input
+                          placeholder="intents: price,order,info"
+                          value={agentForm.intents.join(',')}
+                          onChange={(event) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              intents: event.target.value.split(',').map((v) => v.trim()).filter(Boolean),
+                            }))
+                          }
+                          className="h-9"
+                        />
+                        <Input
+                          placeholder="variables: API_TOKEN,BASE_URL"
+                          value={agentForm.variables.join(',')}
+                          onChange={(event) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              variables: event.target.value.split(',').map((v) => v.trim().toUpperCase()).filter(Boolean),
+                            }))
+                          }
+                          className="h-9"
+                        />
+                      </div>
+                      <Textarea
+                        placeholder="Agent markdown body instructions..."
+                        value={agentForm.body}
+                        onChange={(event) => setAgentForm((prev) => ({ ...prev, body: event.target.value }))}
+                        className="min-h-[160px] font-mono text-xs"
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" onClick={() => void saveAgent()} disabled={busy}>
+                          <Save className="size-4" /> {editingAgentID ? 'Update Agent' : 'Create Agent'}
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={resetAgentForm} disabled={busy}>
+                          Clear
+                        </Button>
+                      </div>
+                      <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                        {agents.map((agent) => (
+                          <div key={agent.id} className="flex items-center justify-between border-b border-border/40 py-1 last:border-b-0">
+                            <div className="min-w-0">
+                              <p className="font-medium">{agent.id}</p>
+                              <p className="truncate text-xs text-muted-foreground">{agent.description || agent.name}</p>
+                            </div>
+                            <div className="flex gap-1">
+                              <Button size="sm" variant="outline" onClick={() => startEditAgent(agent)}>Edit</Button>
+                              <Button size="sm" variant="destructive" onClick={() => void deleteAgent(agent.id)}>Delete</Button>
+                            </div>
+                          </div>
+                        ))}
+                        {agents.length === 0 ? <p className="text-xs text-muted-foreground">No agents yet.</p> : null}
+                      </div>
+                    </CardContent>
+                  </Card>
+                </section>
+
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <Terminal className="size-4" /> Realtime Logs
                     </CardTitle>
                     <CardDescription>Streaming from backend SSE endpoint `/api/logs/stream`.</CardDescription>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant={logMode === 'all' ? 'default' : 'outline'} onClick={() => setLogMode('all')}>
+                        All
+                      </Button>
+                      <Button size="sm" variant={logMode === 'orchestrator' ? 'default' : 'outline'} onClick={() => setLogMode('orchestrator')}>
+                        Execution Logs
+                      </Button>
+                    </div>
                   </CardHeader>
                   <CardContent>
                     <div className="max-h-[380px] overflow-auto rounded-lg border border-border/60 bg-zinc-950 p-3 font-mono text-xs text-zinc-100">
-                      {logs.map((entry, index) => (
+                      {filteredLogs.map((entry, index) => (
                         <div key={`${entry.time}-${index}`} className="mb-1 break-all">
                           <span className="text-zinc-400">[{entry.time}]</span>{' '}
                           <span className={entry.level.includes('error') ? 'text-rose-300' : entry.level.includes('warn') ? 'text-amber-300' : 'text-emerald-300'}>
@@ -854,7 +1141,7 @@ export default function App() {
                           <span>{entry.message}</span>
                         </div>
                       ))}
-                      {logs.length === 0 ? <p className="text-zinc-400">No logs yet.</p> : null}
+                      {filteredLogs.length === 0 ? <p className="text-zinc-400">No logs yet.</p> : null}
                     </div>
                   </CardContent>
                 </Card>
