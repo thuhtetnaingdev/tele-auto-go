@@ -64,10 +64,10 @@ get_release_asset_urls() {
   echo "$body" | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
-ensure_release_assets() {
+resolve_release_assets() {
   local tag="$1"
   local arch="$2"
-  local expected_app expected_web urls
+  local expected_app expected_web urls app_url web_url
   expected_app="tele-auto-go_${tag}_linux_${arch}.tar.gz"
   expected_web="tele-auto-go-web_${tag}.tar.gz"
 
@@ -80,16 +80,36 @@ ensure_release_assets() {
     return 1
   fi
 
-  if ! echo "$urls" | grep -q "/${expected_app}$"; then
-    echo "Missing asset: ${expected_app}" >&2
-    echo "Please upload it to release ${tag}." >&2
+  app_url="$(echo "$urls" | grep "/${expected_app}$" | head -n1 || true)"
+  web_url="$(echo "$urls" | grep "/${expected_web}$" | head -n1 || true)"
+
+  if [[ -z "$app_url" ]]; then
+    app_url="$(echo "$urls" | grep -E "/tele-auto-go_[^/]+_linux_${arch}\\.tar\\.gz$" | head -n1 || true)"
+    if [[ -n "$app_url" ]]; then
+      echo "Warning: Using fallback app asset instead of ${expected_app}" >&2
+      echo "         selected: ${app_url##*/}" >&2
+    fi
+  fi
+
+  if [[ -z "$web_url" ]]; then
+    web_url="$(echo "$urls" | grep -E "/tele-auto-go-web_[^/]+\\.tar\\.gz$" | head -n1 || true)"
+    if [[ -n "$web_url" ]]; then
+      echo "Warning: Using fallback web asset instead of ${expected_web}" >&2
+      echo "         selected: ${web_url##*/}" >&2
+    fi
+  fi
+
+  if [[ -z "$app_url" || -z "$web_url" ]]; then
+    echo "Missing required assets in release ${tag}." >&2
+    echo "Expected assets:" >&2
+    echo "  - ${expected_app}" >&2
+    echo "  - ${expected_web}" >&2
+    echo "Available assets:" >&2
+    echo "$urls" | sed 's|.*/||' | sed 's|^|  - |' >&2
     return 1
   fi
-  if ! echo "$urls" | grep -q "/${expected_web}$"; then
-    echo "Missing asset: ${expected_web}" >&2
-    echo "Please upload it to release ${tag}." >&2
-    return 1
-  fi
+
+  printf '%s|%s\n' "$app_url" "$web_url"
 }
 
 resolve_version() {
@@ -348,12 +368,14 @@ main() {
   need_cmd systemctl
   need_cmd getent
 
-  local arch release_tag base_url app_tar web_tar cli_user_home cli_user_link env_file
+  local arch release_tag app_url web_url app_tar web_tar cli_user_home cli_user_link env_file asset_urls
   arch="$(detect_arch)"
   release_tag="$(resolve_version)"
-  base_url="https://github.com/${REPO}/releases/download/${release_tag}"
-  app_tar="tele-auto-go_${release_tag}_linux_${arch}.tar.gz"
-  web_tar="tele-auto-go-web_${release_tag}.tar.gz"
+  asset_urls="$(resolve_release_assets "$release_tag" "$arch")"
+  app_url="${asset_urls%%|*}"
+  web_url="${asset_urls#*|}"
+  app_tar="${app_url##*/}"
+  web_tar="${web_url##*/}"
   cli_user_home="$(resolve_cli_user_home)"
   cli_user_link="${cli_user_home}/.local/bin/tele-auto"
   env_file="$INSTALL_DIR/etc/tele-auto.env"
@@ -364,13 +386,14 @@ main() {
   echo "    arch: ${arch}"
 
   echo "==> Checking release assets"
-  ensure_release_assets "$release_tag" "$arch"
+  echo "    app: ${app_tar}"
+  echo "    web: ${web_tar}"
 
   TMP_DIR="$(mktemp -d)"
 
   echo "==> Downloading artifacts"
-  curl -fL "${base_url}/${app_tar}" -o "${TMP_DIR}/${app_tar}"
-  curl -fL "${base_url}/${web_tar}" -o "${TMP_DIR}/${web_tar}"
+  curl -fL "${app_url}" -o "${TMP_DIR}/${app_tar}"
+  curl -fL "${web_url}" -o "${TMP_DIR}/${web_tar}"
 
   mkdir -p "${TMP_DIR}/app"
   tar -xzf "${TMP_DIR}/${app_tar}" -C "${TMP_DIR}/app"
