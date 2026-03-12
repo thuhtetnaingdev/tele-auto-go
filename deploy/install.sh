@@ -6,7 +6,7 @@ APP_USER="${APP_USER:-teleauto}"
 APP_GROUP="${APP_GROUP:-teleauto}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/tele-auto-go}"
 SERVICE_NAME="${SERVICE_NAME:-tele-auto}"
-REPO="${REPO:-thuhtetnaing/tele-auto-go}"
+REPO="${REPO:-thuhtetnaingdev/tele-auto-go}"
 VERSION="${VERSION:-latest}"
 
 need_cmd() {
