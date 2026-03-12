@@ -1,0 +1,93 @@
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 38 46% 97%;
+    --foreground: 24 24% 16%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 24 24% 16%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 24 24% 16%;
+
+    --primary: 23 90% 48%;
+    --primary-foreground: 40 100% 98%;
+
+    --secondary: 166 33% 86%;
+    --secondary-foreground: 172 54% 18%;
+
+    --muted: 40 28% 92%;
+    --muted-foreground: 25 12% 42%;
+
+    --accent: 48 91% 88%;
+    --accent-foreground: 30 35% 24%;
+
+    --destructive: 0 80% 52%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 28 22% 82%;
+    --input: 28 22% 82%;
+    --ring: 23 90% 48%;
+
+    --radius: 0.85rem;
+  }
+
+  .dark {
+    --background: 24 20% 9%;
+    --foreground: 35 40% 96%;
+
+    --card: 24 19% 12%;
+    --card-foreground: 35 40% 96%;
+
+    --popover: 24 19% 12%;
+    --popover-foreground: 35 40% 96%;
+
+    --primary: 30 92% 58%;
+    --primary-foreground: 20 100% 8%;
+
+    --secondary: 172 35% 22%;
+    --secondary-foreground: 160 40% 90%;
+
+    --muted: 25 14% 20%;
+    --muted-foreground: 36 13% 70%;
+
+    --accent: 48 65% 28%;
+    --accent-foreground: 43 97% 89%;
+
+    --destructive: 0 62% 42%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 24 14% 25%;
+    --input: 24 14% 25%;
+    --ring: 30 92% 58%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Sora', sans-serif;
+    background-image:
+      radial-gradient(circle at 10% 5%, rgba(251, 191, 36, 0.14), transparent 36%),
+      radial-gradient(circle at 90% 10%, rgba(20, 184, 166, 0.14), transparent 34%),
+      radial-gradient(circle at 50% 90%, rgba(249, 115, 22, 0.1), transparent 40%);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .font-display {
+    font-family: 'Sora', sans-serif;
+    font-weight: 700;
+  }
+}

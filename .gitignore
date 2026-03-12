@@ -1,0 +1,12 @@
+*.log
+.DS_Store
+
+backend/.env
+backend/bin/
+backend/data/
+
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+release/

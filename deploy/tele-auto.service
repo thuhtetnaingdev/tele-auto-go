@@ -1,0 +1,18 @@
+[Unit]
+Description=Tele Auto Control Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+Group=__APP_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/etc/tele-auto.env
+ExecStart=__INSTALL_DIR__/bin/tele-auto-control
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
