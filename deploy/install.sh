@@ -253,6 +253,47 @@ ensure_admin_credentials() {
   echo "==> Admin login configured in ${env_file}"
 }
 
+stop_existing_runtime() {
+  local env_file="$1"
+  local port pids
+
+  echo "==> Stopping existing runtime (if any)"
+  systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+
+  if [[ -f "$env_file" ]]; then
+    port="$(get_env_value CONTROL_PORT "$env_file")"
+  fi
+  port="${port:-3000}"
+
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+    if [[ -n "$pids" ]]; then
+      echo "Stopping listener(s) on :${port} => ${pids}"
+      kill $pids 2>/dev/null || true
+      sleep 1
+      pids="$(lsof -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+      if [[ -n "$pids" ]]; then
+        echo "Force killing :${port} => ${pids}"
+        kill -9 $pids 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  if command -v pgrep >/dev/null 2>&1; then
+    pids="$(pgrep -f 'tele-auto-control' || true)"
+    if [[ -n "$pids" ]]; then
+      echo "Stopping tele-auto-control process(es): ${pids}"
+      kill $pids 2>/dev/null || true
+      sleep 1
+      pids="$(pgrep -f 'tele-auto-control' || true)"
+      if [[ -n "$pids" ]]; then
+        echo "Force killing tele-auto-control process(es): ${pids}"
+        kill -9 $pids 2>/dev/null || true
+      fi
+    fi
+  fi
+}
+
 write_uninstall_script() {
   local cli_user_link="$1"
   cat > "$INSTALL_DIR/bin/uninstall.sh" <<UNINSTALL
@@ -388,6 +429,8 @@ main() {
   echo "==> Checking release assets"
   echo "    app: ${app_tar}"
   echo "    web: ${web_tar}"
+
+  stop_existing_runtime "$env_file"
 
   TMP_DIR="$(mktemp -d)"
 
