@@ -22,6 +22,8 @@ type Agent struct {
 	Intents     []string `json:"intents"`
 	Tools       []string `json:"tools"`
 	Variables   []string `json:"variables"`
+	Visibility  string   `json:"visibility"`
+	AllowUsers  []string `json:"allowUsers"`
 	Model       string   `json:"model,omitempty"`
 	Temperature float64  `json:"temperature,omitempty"`
 	Body        string   `json:"body"`
@@ -36,6 +38,8 @@ type UpsertAgentInput struct {
 	Intents     []string `json:"intents"`
 	Tools       []string `json:"tools"`
 	Variables   []string `json:"variables"`
+	Visibility  string   `json:"visibility"`
+	AllowUsers  []string `json:"allowUsers"`
 	Model       string   `json:"model,omitempty"`
 	Temperature float64  `json:"temperature,omitempty"`
 	Body        string   `json:"body"`
@@ -48,6 +52,8 @@ type frontmatter struct {
 	Intents     []string `yaml:"intents"`
 	Tools       []string `yaml:"tools"`
 	Variables   []string `yaml:"variables"`
+	Visibility  string   `yaml:"visibility"`
+	AllowUsers  []string `yaml:"allow_users"`
 	Model       string   `yaml:"model,omitempty"`
 	Temperature float64  `yaml:"temperature,omitempty"`
 }
@@ -62,6 +68,12 @@ type Manager struct {
 
 var agentIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{2,64}$`)
 var varKeyPattern = regexp.MustCompile(`^[A-Z0-9_]{2,64}$`)
+var allowUserUsernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{3,64}$`)
+
+const (
+	VisibilityPublic  = "public"
+	VisibilityPrivate = "private"
+)
 
 func NewManager(dir string, logger *slog.Logger) (*Manager, error) {
 	dir = strings.TrimSpace(dir)
@@ -97,6 +109,8 @@ func (m *Manager) seedDefault() error {
 		Intents:     []string{"general", "faq", "support"},
 		Tools:       []string{"api_call"},
 		Variables:   []string{},
+		Visibility:  VisibilityPublic,
+		AllowUsers:  []string{},
 		Body:        "You are the default support agent. Understand user intent, call api_call when external data is needed, and return concise human-friendly Burmese or same-language replies.",
 	}
 	if _, err := m.Upsert(seed); err != nil {
@@ -215,11 +229,17 @@ func parseAgentFile(path string) (Agent, error) {
 		Intents:     meta.Intents,
 		Tools:       meta.Tools,
 		Variables:   meta.Variables,
+		Visibility:  strings.TrimSpace(meta.Visibility),
+		AllowUsers:  meta.AllowUsers,
 		Model:       strings.TrimSpace(meta.Model),
 		Temperature: meta.Temperature,
 		Body:        strings.TrimSpace(body),
 	}
 	if err := validateInput(input); err != nil {
+		return Agent{}, err
+	}
+	normalizedAllowUsers, err := normalizeAllowUsers(input.AllowUsers)
+	if err != nil {
 		return Agent{}, err
 	}
 	st, _ := os.Stat(path)
@@ -234,6 +254,8 @@ func parseAgentFile(path string) (Agent, error) {
 		Intents:     normalizeList(input.Intents),
 		Tools:       normalizeList(input.Tools),
 		Variables:   normalizeList(input.Variables),
+		Visibility:  normalizeVisibility(input.Visibility),
+		AllowUsers:  normalizedAllowUsers,
 		Model:       input.Model,
 		Temperature: input.Temperature,
 		Body:        input.Body,
@@ -250,9 +272,15 @@ func buildMarkdown(input UpsertAgentInput) (string, error) {
 		Intents:     normalizeList(input.Intents),
 		Tools:       normalizeList(input.Tools),
 		Variables:   normalizeList(input.Variables),
+		Visibility:  normalizeVisibility(input.Visibility),
 		Model:       strings.TrimSpace(input.Model),
 		Temperature: input.Temperature,
 	}
+	normalizedAllowUsers, err := normalizeAllowUsers(input.AllowUsers)
+	if err != nil {
+		return "", err
+	}
+	meta.AllowUsers = normalizedAllowUsers
 	yb, err := yaml.Marshal(&meta)
 	if err != nil {
 		return "", err
@@ -313,10 +341,90 @@ func validateInput(input UpsertAgentInput) error {
 			return fmt.Errorf("invalid variable key in variables: %s", key)
 		}
 	}
+	rawVisibility := strings.TrimSpace(input.Visibility)
+	if rawVisibility != "" {
+		normalizedRaw := strings.ToLower(rawVisibility)
+		if normalizedRaw != VisibilityPublic && normalizedRaw != VisibilityPrivate {
+			return errors.New("visibility must be public or private")
+		}
+	}
+	visibility := normalizeVisibility(rawVisibility)
+	allowUsers, err := normalizeAllowUsers(input.AllowUsers)
+	if err != nil {
+		return err
+	}
+	if visibility == VisibilityPrivate && len(allowUsers) == 0 {
+		return errors.New("allow users is required for private agents")
+	}
 	if input.Temperature < 0 || input.Temperature > 2 {
 		return errors.New("temperature must be between 0 and 2")
 	}
 	return nil
+}
+
+func normalizeVisibility(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case VisibilityPrivate:
+		return VisibilityPrivate
+	default:
+		return VisibilityPublic
+	}
+}
+
+func normalizeAllowUsers(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, item := range in {
+		v, err := normalizeAllowUser(item)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func normalizeAllowUser(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", nil
+	}
+	v = strings.TrimPrefix(v, "@")
+	if v == "" {
+		return "", fmt.Errorf("invalid allow user: %q", raw)
+	}
+	if strings.IndexFunc(v, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' ' }) >= 0 {
+		return "", fmt.Errorf("invalid allow user: %q", raw)
+	}
+	if allDigits(v) {
+		v = strings.TrimLeft(v, "0")
+		if v == "" {
+			v = "0"
+		}
+		return v, nil
+	}
+	v = strings.ToLower(v)
+	if !allowUserUsernamePattern.MatchString(v) {
+		return "", fmt.Errorf("invalid allow user: %q", raw)
+	}
+	return v, nil
+}
+
+func allDigits(v string) bool {
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return v != ""
 }
 
 func normalizeList(in []string) []string {

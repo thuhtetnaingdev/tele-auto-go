@@ -77,6 +77,20 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		run.ErrorMessage = "no agents configured"
 		return e.fail(mc, run, started, "load_agents", "Sorry, no agent is configured yet.")
 	}
+	accessibleAgents, deniedPrivate := filterAccessibleAgents(agentList, mc.TriggerUserID, mc.TriggerUsername)
+	e.logger.Info("orchestrator_agent_access_filter",
+		"chat_id", mc.ChatID,
+		"trigger_message", mc.TriggerMessage,
+		"trigger_user_id", strings.TrimSpace(mc.TriggerUserID),
+		"trigger_username", strings.TrimSpace(mc.TriggerUsername),
+		"total_agents", len(agentList),
+		"accessible_agents", len(accessibleAgents),
+		"denied_private_agents", deniedPrivate,
+	)
+	if len(accessibleAgents) == 0 {
+		run.ErrorMessage = "no accessible agents for requester"
+		return e.fail(mc, run, started, "authorize_agents", "Sorry, you are not allowed to access available agents.")
+	}
 
 	vars, types, err := e.store.GlobalVariablesMap(ctx)
 	if err != nil {
@@ -84,7 +98,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		return e.fail(mc, run, started, "load_variables", "Sorry, failed to load runtime variables.")
 	}
 
-	route, err := e.routeAgent(ctx, mc, agentList)
+	route, err := e.routeAgent(ctx, mc, accessibleAgents)
 	if err != nil {
 		run.ErrorMessage = "route agent: " + err.Error()
 		return e.fail(mc, run, started, "route_agent", "Sorry, I couldn't decide the right handler right now.")
@@ -195,6 +209,39 @@ type apiToolArgs struct {
 	Query     map[string]string `json:"query"`
 	JSONBody  map[string]any    `json:"json_body"`
 	TimeoutMS int               `json:"timeout_ms"`
+}
+
+func (a *apiToolArgs) UnmarshalJSON(data []byte) error {
+	type rawArgs struct {
+		Method    string         `json:"method"`
+		URL       string         `json:"url"`
+		Headers   map[string]any `json:"headers"`
+		Query     map[string]any `json:"query"`
+		JSONBody  map[string]any `json:"json_body"`
+		TimeoutMS int            `json:"timeout_ms"`
+	}
+
+	var raw rawArgs
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	headers, err := stringifyScalarMap(raw.Headers)
+	if err != nil {
+		return fmt.Errorf("headers: %w", err)
+	}
+	query, err := stringifyScalarMap(raw.Query)
+	if err != nil {
+		return fmt.Errorf("query: %w", err)
+	}
+
+	a.Method = raw.Method
+	a.URL = raw.URL
+	a.Headers = headers
+	a.Query = query
+	a.JSONBody = raw.JSONBody
+	a.TimeoutMS = raw.TimeoutMS
+	return nil
 }
 
 type apiToolResponse struct {
@@ -605,15 +652,101 @@ func parseJSONLike(raw string, out any) error {
 	if raw == "" {
 		return fmt.Errorf("empty output")
 	}
-	if err := json.Unmarshal([]byte(raw), out); err == nil {
-		return nil
+	candidates := []string{raw}
+	if unquoted, err := strconv.Unquote(raw); err == nil {
+		candidates = append(candidates, strings.TrimSpace(unquoted))
 	}
 	start := strings.Index(raw, "{")
 	end := strings.LastIndex(raw, "}")
 	if start >= 0 && end > start {
-		return json.Unmarshal([]byte(raw[start:end+1]), out)
+		candidates = append(candidates, raw[start:end+1])
 	}
-	return fmt.Errorf("output is not valid json")
+
+	lastErr := fmt.Errorf("output is not valid json")
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if err := json.Unmarshal([]byte(candidate), out); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		repaired := repairEscapedJSON(candidate)
+		if repaired == candidate {
+			continue
+		}
+		if _, ok := seen[repaired]; ok {
+			continue
+		}
+		seen[repaired] = struct{}{}
+		if err := json.Unmarshal([]byte(repaired), out); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+var escapedJSONKeyPattern = regexp.MustCompile(`\\\"([A-Za-z0-9_]+)\\\"(\s*:)`)
+var escapedJSONStringValuePattern = regexp.MustCompile(`:\s*\\\"((?:[^"\\]|\\.)*)\\\"(\s*[,}\]])`)
+
+func repairEscapedJSON(raw string) string {
+	repaired := raw
+	for i := 0; i < 4; i++ {
+		next := escapedJSONKeyPattern.ReplaceAllString(repaired, `"$1"$2`)
+		next = escapedJSONStringValuePattern.ReplaceAllString(next, `:"$1"$2`)
+		if next == repaired {
+			return next
+		}
+		repaired = next
+	}
+	return repaired
+}
+
+func stringifyScalarMap(values map[string]any) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		if value == nil {
+			continue
+		}
+		text, err := stringifyScalar(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		out[key] = text
+	}
+	return out, nil
+}
+
+func stringifyScalar(value any) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	case json.Number:
+		return v.String(), nil
+	default:
+		buf, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(buf), nil
+	}
 }
 
 func maxFloat(a, b float64) float64 {
@@ -635,6 +768,96 @@ func (e *Engine) fail(mc MessageContext, run store.OrchestrationRun, started tim
 		"duration_ms", time.Since(started).Milliseconds(),
 	)
 	return userReply, nil
+}
+
+func filterAccessibleAgents(agentsList []agents.Agent, requesterID, requesterUsername string) ([]agents.Agent, int) {
+	out := make([]agents.Agent, 0, len(agentsList))
+	normalizedID := normalizeRequesterID(requesterID)
+	normalizedUsername := normalizeRequesterUsername(requesterUsername)
+	deniedPrivate := 0
+
+	for _, agent := range agentsList {
+		if isAgentAccessible(agent, normalizedID, normalizedUsername) {
+			out = append(out, agent)
+			continue
+		}
+		deniedPrivate++
+	}
+	return out, deniedPrivate
+}
+
+func isAgentAccessible(agent agents.Agent, requesterID, requesterUsername string) bool {
+	visibility := strings.ToLower(strings.TrimSpace(agent.Visibility))
+	if visibility == "" {
+		visibility = agents.VisibilityPublic
+	}
+	if visibility != agents.VisibilityPrivate {
+		return true
+	}
+
+	for _, allowed := range agent.AllowUsers {
+		v := normalizeAllowUserForMatch(allowed)
+		if v == "" {
+			continue
+		}
+		if requesterID != "" && v == requesterID {
+			return true
+		}
+		if requesterUsername != "" && v == requesterUsername {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeRequesterID(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	if !allDigitsText(v) {
+		return ""
+	}
+	v = strings.TrimLeft(v, "0")
+	if v == "" {
+		return "0"
+	}
+	return v
+}
+
+func normalizeRequesterUsername(raw string) string {
+	v := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+	if v == "" {
+		return ""
+	}
+	return strings.ToLower(v)
+}
+
+func normalizeAllowUserForMatch(raw string) string {
+	v := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+	if v == "" {
+		return ""
+	}
+	if allDigitsText(v) {
+		v = strings.TrimLeft(v, "0")
+		if v == "" {
+			return "0"
+		}
+		return v
+	}
+	return strings.ToLower(v)
+}
+
+func allDigitsText(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func routeByKeywords(message string, agentsList []agents.Agent) (RouterResult, bool) {

@@ -613,6 +613,8 @@ type upsertAgentRequest struct {
 	Intents     []string `json:"intents"`
 	Tools       []string `json:"tools"`
 	Variables   []string `json:"variables"`
+	Visibility  string   `json:"visibility"`
+	AllowUsers  []string `json:"allowUsers"`
 	Model       string   `json:"model"`
 	Temperature float64  `json:"temperature"`
 	Body        string   `json:"body"`
@@ -770,6 +772,8 @@ func (s *apiServer) handleAgents(w http.ResponseWriter, r *http.Request) {
 			Intents:     req.Intents,
 			Tools:       req.Tools,
 			Variables:   req.Variables,
+			Visibility:  req.Visibility,
+			AllowUsers:  req.AllowUsers,
 			Model:       req.Model,
 			Temperature: req.Temperature,
 			Body:        req.Body,
@@ -833,6 +837,8 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 			Intents:     req.Intents,
 			Tools:       req.Tools,
 			Variables:   req.Variables,
+			Visibility:  req.Visibility,
+			AllowUsers:  req.AllowUsers,
 			Model:       req.Model,
 			Temperature: req.Temperature,
 			Body:        req.Body,

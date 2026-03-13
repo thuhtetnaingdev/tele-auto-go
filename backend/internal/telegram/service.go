@@ -279,12 +279,21 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	reply := ""
 	replySource := "none"
 	if s.orch != nil {
+		triggerUserID := senderIDFromMessagePeer(msg.GetFromID)
+		if triggerUserID == "" {
+			if peerUser, ok := msg.GetPeerID().(*tg.PeerUser); ok {
+				triggerUserID = strconv.FormatInt(peerUser.UserID, 10)
+			}
+		}
+		triggerUsername := s.usernameFromMessage(ctx, entities, msg)
 		reply, err = s.orch.Handle(ctx, orchestrator.MessageContext{
-			ChatID:         chatID,
-			ChatName:       s.chatNameFromPeer(ctx, entities, peerID),
-			LatestIncoming: latestIncomingText,
-			RecentMessages: toContextLines(history),
-			TriggerMessage: triggerID,
+			ChatID:          chatID,
+			ChatName:        s.chatNameFromPeer(ctx, entities, peerID),
+			LatestIncoming:  latestIncomingText,
+			RecentMessages:  toContextLines(history),
+			TriggerMessage:  triggerID,
+			TriggerUserID:   triggerUserID,
+			TriggerUsername: triggerUsername,
 		}, s.soulPrompt)
 		if err != nil {
 			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
@@ -579,6 +588,39 @@ func (s *Service) isPeerBot(ctx context.Context, entities tg.Entities, peer tg.P
 		return false
 	}
 	return raw.Bot
+}
+
+func (s *Service) usernameFromMessage(ctx context.Context, entities tg.Entities, msg *tg.Message) string {
+	from, ok := msg.GetFromID()
+	if ok && from != nil {
+		if p, ok := from.(*tg.PeerUser); ok {
+			return s.usernameFromUserID(ctx, entities, p.UserID)
+		}
+	}
+	if peerUser, ok := msg.GetPeerID().(*tg.PeerUser); ok {
+		return s.usernameFromUserID(ctx, entities, peerUser.UserID)
+	}
+	return ""
+}
+
+func (s *Service) usernameFromUserID(ctx context.Context, entities tg.Entities, userID int64) string {
+	if userID == 0 {
+		return ""
+	}
+	u, ok := entities.Users[userID]
+	if ok && u != nil {
+		if username := strings.TrimSpace(u.Username); username != "" {
+			return username
+		}
+	}
+	resolved, err := s.peerMgr.ResolveUserID(ctx, userID)
+	if err != nil {
+		return ""
+	}
+	if username, ok := resolved.Username(); ok {
+		return strings.TrimSpace(username)
+	}
+	return ""
 }
 
 func (s *Service) chatNameFromPeer(ctx context.Context, entities tg.Entities, peer tg.PeerClass) string {

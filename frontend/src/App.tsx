@@ -97,6 +97,8 @@ type AgentDefinition = {
   intents: string[]
   tools: string[]
   variables: string[]
+  visibility?: 'public' | 'private'
+  allowUsers?: string[]
   model?: string
   temperature?: number
   body: string
@@ -209,6 +211,29 @@ function readInitialPhone() {
   return window.localStorage.getItem('tele_auto_last_phone') || ''
 }
 
+function normalizeAllowUserToken(raw: string) {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+  const withoutAt = trimmed.startsWith('@') ? trimmed.slice(1) : trimmed
+  if (!withoutAt) return ''
+  if (/^\d+$/.test(withoutAt)) {
+    const canonical = withoutAt.replace(/^0+(?=\d)/, '')
+    return canonical || '0'
+  }
+  return withoutAt.toLowerCase()
+}
+
+function normalizeAllowUsersList(values: string[]) {
+  const next = values
+    .map((value) => normalizeAllowUserToken(value))
+    .filter(Boolean)
+  return Array.from(new Set(next))
+}
+
+function parseAllowUsersInput(raw: string) {
+  return normalizeAllowUsersList(raw.split(/[\n,]/g))
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -239,6 +264,7 @@ export default function App() {
 
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [editingAgentID, setEditingAgentID] = useState('')
+  const [allowUsersInput, setAllowUsersInput] = useState('')
   const [agentForm, setAgentForm] = useState<AgentDefinition>({
     id: '',
     name: '',
@@ -246,6 +272,8 @@ export default function App() {
     intents: [],
     tools: ['api_call'],
     variables: [],
+    visibility: 'public',
+    allowUsers: [],
     model: '',
     temperature: 0.35,
     body: '',
@@ -565,6 +593,7 @@ export default function App() {
 
   const resetAgentForm = () => {
     setEditingAgentID('')
+    setAllowUsersInput('')
     setAgentForm({
       id: '',
       name: '',
@@ -572,6 +601,8 @@ export default function App() {
       intents: [],
       tools: ['api_call'],
       variables: [],
+      visibility: 'public',
+      allowUsers: [],
       model: '',
       temperature: 0.35,
       body: '',
@@ -579,12 +610,20 @@ export default function App() {
   }
 
   const startEditAgent = (agent: AgentDefinition) => {
+    const existingAllowUsers = agent.allowUsers || []
+    setAllowUsersInput(
+      existingAllowUsers
+        .map((value) => (/^\d+$/.test(value) ? value : `@${value}`))
+        .join('\n'),
+    )
     setEditingAgentID(agent.id)
     setAgentForm({
       ...agent,
       intents: agent.intents || [],
       tools: ['api_call'],
       variables: agent.variables || [],
+      visibility: agent.visibility || 'public',
+      allowUsers: existingAllowUsers,
       body: agent.body || '',
       temperature: agent.temperature || 0.35,
     })
@@ -597,6 +636,12 @@ export default function App() {
     }
     const normalizedIntents = agentForm.intents.map((v) => v.trim()).filter(Boolean)
     const normalizedVariables = agentForm.variables.map((v) => v.trim().toUpperCase()).filter(Boolean)
+    const normalizedVisibility = agentForm.visibility === 'private' ? 'private' : 'public'
+    const normalizedAllowUsers = parseAllowUsersInput(allowUsersInput)
+    if (normalizedVisibility === 'private' && normalizedAllowUsers.length === 0) {
+      setMessage('Allow users is required when visibility is private.')
+      return
+    }
     const payload = {
       id: agentForm.id.trim(),
       name: agentForm.name.trim(),
@@ -604,6 +649,8 @@ export default function App() {
       intents: normalizedIntents,
       tools: ['api_call'],
       variables: normalizedVariables,
+      visibility: normalizedVisibility,
+      allowUsers: normalizedAllowUsers,
       model: (agentForm.model || '').trim(),
       body: agentForm.body.trim(),
       temperature: Number(agentForm.temperature || 0.35),
@@ -1276,6 +1323,33 @@ export default function App() {
                             onChange={(event) => setAgentForm((prev) => ({ ...prev, description: event.target.value }))}
                             className="h-9 sm:col-span-2"
                           />
+                          <div className="space-y-1 sm:col-span-2">
+                            <Label>Visibility</Label>
+                            <select
+                              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                              value={agentForm.visibility || 'public'}
+                              onChange={(event) =>
+                                setAgentForm((prev) => ({
+                                  ...prev,
+                                  visibility: event.target.value === 'private' ? 'private' : 'public',
+                                }))
+                              }
+                            >
+                              <option value="public">public</option>
+                              <option value="private">private</option>
+                            </select>
+                          </div>
+                          {agentForm.visibility === 'private' ? (
+                            <div className="space-y-1 sm:col-span-2">
+                              <Label>Allow Users</Label>
+                              <Textarea
+                                placeholder="User IDs or usernames (@name), comma or newline separated"
+                                value={allowUsersInput}
+                                onChange={(event) => setAllowUsersInput(event.target.value)}
+                                className="min-h-[76px] font-mono text-xs"
+                              />
+                            </div>
+                          ) : null}
                           <Input
                             placeholder="intents: price,order,info"
                             value={agentForm.intents.join(',')}
@@ -1319,6 +1393,14 @@ export default function App() {
                               <div className="min-w-0">
                                 <p className="break-all font-medium">{agent.id}</p>
                                 <p className="break-words text-xs text-muted-foreground">{agent.description || agent.name}</p>
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                  <Badge variant={(agent.visibility || 'public') === 'private' ? 'secondary' : 'outline'}>
+                                    {(agent.visibility || 'public') === 'private' ? 'Private' : 'Public'}
+                                  </Badge>
+                                  {(agent.visibility || 'public') === 'private' ? (
+                                    <Badge variant="outline">{(agent.allowUsers || []).length} allow users</Badge>
+                                  ) : null}
+                                </div>
                               </div>
                               <div className="flex w-full gap-1 sm:w-auto">
                                 <Button size="sm" variant="outline" className="flex-1 sm:flex-none" onClick={() => startEditAgent(agent)}>Edit</Button>
