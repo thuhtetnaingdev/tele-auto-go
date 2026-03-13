@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
+  BellRing,
   Bot,
   Clock3,
   Database,
@@ -114,6 +115,48 @@ type VariableValue = {
   updatedAt?: string
 }
 
+type ConversationSummary = {
+  chatId: string
+  chatName: string
+  lastMessage: string
+  lastMessageAt: string
+  unreadIncoming: number
+  effectiveMode: 'auto' | 'manual'
+  hasManualOverride: boolean
+  mode?: 'auto' | 'manual'
+}
+
+type ConversationMessage = {
+  id: number
+  chatId: string
+  telegramMessageId: string
+  senderName: string
+  direction: 'me' | 'other_person'
+  text: string
+  createdAt: string
+}
+
+type ConversationsResponse = {
+  globalAutoReplyEnabled: boolean
+  conversations: ConversationSummary[]
+}
+
+type ConversationMessagesResponse = {
+  chatId: string
+  messages: ConversationMessage[]
+}
+
+type ConversationStreamEvent = {
+  type?: string
+  chatId?: string
+  telegramMessageId?: string
+  direction?: 'me' | 'other_person'
+  text?: string
+  mode?: string
+  createdAt?: string
+  occurredAt?: string
+}
+
 type ConfirmDialogState = {
   open: boolean
   title: string
@@ -131,10 +174,10 @@ const API_BASE_RAW = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.
 const API_BASE = API_BASE_RAW ? API_BASE_RAW.replace(/\/+$/, '') : ''
 
 const ONBOARDING_REQUIRED_KEYS = ['TG_API_ID', 'TG_API_HASH', 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL']
-const MAIN_VISIBLE_SETTINGS = ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'AI_CONTEXT_MESSAGE_LIMIT', 'AUTO_REPLY_ENABLED']
+const MAIN_VISIBLE_SETTINGS = ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'AI_CONTEXT_MESSAGE_LIMIT', 'AUTO_REPLY_DEBOUNCE_SECONDS', 'AUTO_REPLY_ENABLED']
 
 const booleanSettingKeys = new Set(['AUTO_REPLY_ENABLED'])
-const numericSettingKeys = new Set(['AI_CONTEXT_MESSAGE_LIMIT'])
+const numericSettingKeys = new Set(['AI_CONTEXT_MESSAGE_LIMIT', 'AUTO_REPLY_DEBOUNCE_SECONDS'])
 const secretSettingKeys = new Set(['OPENAI_API_KEY', 'TG_API_HASH'])
 
 const settingLabels: Record<string, string> = {
@@ -144,6 +187,7 @@ const settingLabels: Record<string, string> = {
   OPENAI_API_KEY: 'OpenAI API Key',
   OPENAI_MODEL: 'OpenAI Model',
   AI_CONTEXT_MESSAGE_LIMIT: 'Context Message Limit',
+  AUTO_REPLY_DEBOUNCE_SECONDS: 'Reply Debounce Seconds',
   AUTO_REPLY_ENABLED: 'Auto Reply Enabled',
 }
 
@@ -234,6 +278,19 @@ function parseAllowUsersInput(raw: string) {
   return normalizeAllowUsersList(raw.split(/[\n,]/g))
 }
 
+function trimNotificationBody(text?: string) {
+  const normalized = (text || '').trim()
+  if (normalized.length <= 140) {
+    return normalized || 'New message received'
+  }
+  return `${normalized.slice(0, 137)}...`
+}
+
+function logNotificationDebug(stage: string, details?: Record<string, unknown>) {
+  const payload = details ? { stage, ...details } : { stage }
+  console.info('[tele-auto][notification-sound]', payload)
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -261,6 +318,11 @@ export default function App() {
 
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [logMode, setLogMode] = useState<'all' | 'orchestrator'>('all')
+  const [globalAutoReplyEnabled, setGlobalAutoReplyEnabled] = useState(true)
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [selectedChatId, setSelectedChatId] = useState('')
+  const [messagesByChat, setMessagesByChat] = useState<Record<string, ConversationMessage[]>>({})
+  const [manualReplyText, setManualReplyText] = useState('')
 
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [editingAgentID, setEditingAgentID] = useState('')
@@ -291,9 +353,22 @@ export default function App() {
     successText: '',
   })
   const confirmResolverRef = useRef<((ok: boolean) => void) | null>(null)
+  const conversationsRef = useRef<ConversationSummary[]>([])
+  const selectedChatIdRef = useRef('')
+  const globalAutoReplyEnabledRef = useRef(true)
+  const notifiedEventKeysRef = useRef<Set<string>>(new Set())
+  const conversationThreadRef = useRef<HTMLDivElement | null>(null)
+  const lastRenderedMessageKeyRef = useRef('')
+  const notificationAudioContextRef = useRef<AudioContext | null>(null)
   const [activePage, setActivePage] = useState<MainPage>('dashboard')
   const [activeSettingsPage, setActiveSettingsPage] = useState<SettingsPage>('setting')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | 'unsupported'>(() => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      return 'unsupported'
+    }
+    return window.Notification.permission
+  })
 
   const settingsValues = settings && settings.values && typeof settings.values === 'object' ? settings.values : {}
   const savedSettingsValues = savedSettings && savedSettings.values && typeof savedSettings.values === 'object' ? savedSettings.values : {}
@@ -322,6 +397,247 @@ export default function App() {
       setAdminSession((prev) => ({ ...prev, authenticated: false }))
     }
     setMessage(text)
+  }
+
+  const syncNotificationPermission = () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      setNotificationPermission('unsupported')
+      return
+    }
+    setNotificationPermission(window.Notification.permission)
+  }
+
+  const ensureNotificationAudioContext = async () => {
+    if (typeof window === 'undefined' || typeof window.AudioContext === 'undefined') {
+      logNotificationDebug('audio-context-unsupported')
+      return null
+    }
+    if (!notificationAudioContextRef.current) {
+      notificationAudioContextRef.current = new window.AudioContext()
+      logNotificationDebug('audio-context-created', { state: notificationAudioContextRef.current.state })
+    }
+    if (notificationAudioContextRef.current.state === 'suspended') {
+      try {
+        await notificationAudioContextRef.current.resume()
+        logNotificationDebug('audio-context-resumed', { state: notificationAudioContextRef.current.state })
+      } catch {
+        logNotificationDebug('audio-context-resume-failed', { state: notificationAudioContextRef.current.state })
+        return notificationAudioContextRef.current
+      }
+    }
+    return notificationAudioContextRef.current
+  }
+
+  const playNotificationSound = async () => {
+    const audioContext = await ensureNotificationAudioContext()
+    if (!audioContext || audioContext.state !== 'running') {
+      logNotificationDebug('sound-skipped', {
+        reason: 'audio-context-not-running',
+        state: audioContext?.state || 'missing',
+      })
+      return
+    }
+
+    const startAt = audioContext.currentTime
+    const oscillator = audioContext.createOscillator()
+    const gain = audioContext.createGain()
+
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(880, startAt)
+    oscillator.frequency.exponentialRampToValueAtTime(660, startAt + 0.18)
+
+    gain.gain.setValueAtTime(0.0001, startAt)
+    gain.gain.exponentialRampToValueAtTime(0.12, startAt + 0.02)
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.26)
+
+    oscillator.connect(gain)
+    gain.connect(audioContext.destination)
+    oscillator.start(startAt)
+    oscillator.stop(startAt + 0.28)
+    logNotificationDebug('sound-played', { state: audioContext.state, at: startAt })
+  }
+
+  const rememberNotifiedEvent = (key: string) => {
+    if (!key) return
+    const next = notifiedEventKeysRef.current
+    next.add(key)
+    if (next.size > 400) {
+      const oldest = next.values().next().value
+      if (oldest) {
+        next.delete(oldest)
+      }
+    }
+  }
+
+  const requestBrowserNotifications = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      logNotificationDebug('permission-request-skipped', { reason: 'notification-unsupported' })
+      setMessage('This browser does not support desktop notifications.')
+      return
+    }
+    try {
+      await ensureNotificationAudioContext()
+      const permission = await window.Notification.requestPermission()
+      logNotificationDebug('permission-request-result', { permission })
+      setNotificationPermission(permission)
+      if (permission === 'granted') {
+        setMessage('Browser notifications enabled for manual chats.')
+        return
+      }
+      if (permission === 'denied') {
+        setMessage('Browser notifications are blocked. Allow them in browser site settings.')
+        return
+      }
+      setMessage('Browser notification permission was dismissed.')
+    } catch {
+      logNotificationDebug('permission-request-failed')
+      setMessage('Unable to request browser notification permission.')
+    }
+  }
+
+  const notifyForManualConversation = (event: ConversationStreamEvent, connectedAt: number) => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      logNotificationDebug('notify-skipped', { reason: 'notification-unsupported' })
+      return
+    }
+    if (window.Notification.permission !== 'granted') {
+      logNotificationDebug('notify-skipped', {
+        reason: 'permission-not-granted',
+        permission: window.Notification.permission,
+      })
+      return
+    }
+    if (event.type !== 'message_created' || event.direction !== 'other_person') {
+      return
+    }
+
+    const eventTime = Date.parse(event.occurredAt || event.createdAt || '')
+    if (Number.isFinite(eventTime) && eventTime < connectedAt - 5000) {
+      logNotificationDebug('notify-skipped', {
+        reason: 'event-before-connection',
+        chatId: event.chatId || '',
+      })
+      return
+    }
+
+    const chatID = (event.chatId || '').trim()
+    if (!chatID) {
+      logNotificationDebug('notify-skipped', { reason: 'missing-chat-id' })
+      return
+    }
+    const conversation = conversationsRef.current.find((item) => item.chatId === chatID)
+    const isManual = !globalAutoReplyEnabledRef.current || conversation?.effectiveMode === 'manual'
+    if (!isManual) {
+      logNotificationDebug('notify-skipped', {
+        reason: 'conversation-not-manual',
+        chatId: chatID,
+        effectiveMode: conversation?.effectiveMode || 'unknown',
+      })
+      return
+    }
+
+    const dedupeKey = `${chatID}:${(event.telegramMessageId || event.occurredAt || event.createdAt || '').trim()}`
+    const isActiveVisibleChat =
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'visible' &&
+      selectedChatIdRef.current === chatID
+    if (isActiveVisibleChat) {
+      const activeChatSoundKey = `${dedupeKey || `${chatID}:active-visible`}:sound-only`
+      if (notifiedEventKeysRef.current.has(activeChatSoundKey)) {
+        logNotificationDebug('notify-skipped', {
+          reason: 'duplicate-active-chat-sound',
+          chatId: chatID,
+          dedupeKey: activeChatSoundKey,
+        })
+        return
+      }
+      rememberNotifiedEvent(activeChatSoundKey)
+      logNotificationDebug('notify-sound-only', {
+        reason: 'active-visible-chat',
+        chatId: chatID,
+      })
+      void playNotificationSound()
+      return
+    }
+    if (!dedupeKey || notifiedEventKeysRef.current.has(dedupeKey)) {
+      logNotificationDebug('notify-skipped', {
+        reason: 'duplicate-event',
+        chatId: chatID,
+        dedupeKey,
+      })
+      return
+    }
+    rememberNotifiedEvent(dedupeKey)
+    logNotificationDebug('notify-triggered', {
+      chatId: chatID,
+      dedupeKey,
+      permission: window.Notification.permission,
+    })
+    void playNotificationSound()
+
+    const title = conversation?.chatName || chatID
+    const notification = new window.Notification(title, {
+      body: trimNotificationBody(event.text),
+      tag: dedupeKey,
+    })
+    notification.onclick = () => {
+      window.focus()
+      setActivePage('dashboard')
+      setSelectedChatId(chatID)
+      notification.close()
+    }
+  }
+
+  const refreshConversations = async () => {
+    const convPayload = await apiRequest<ConversationsResponse>('/api/conversations?limit=200')
+    setGlobalAutoReplyEnabled(convPayload.globalAutoReplyEnabled)
+    setConversations(convPayload.conversations || [])
+    setSelectedChatId((prev) => {
+      if (prev && (convPayload.conversations || []).some((c) => c.chatId === prev)) {
+        return prev
+      }
+      return (convPayload.conversations || [])[0]?.chatId || ''
+    })
+  }
+
+  const appendConversationMessage = (event: ConversationStreamEvent) => {
+    const chatId = (event.chatId || '').trim()
+    const telegramMessageId = (event.telegramMessageId || '').trim()
+    const direction = event.direction
+    const createdAt = (event.createdAt || event.occurredAt || new Date().toISOString()).trim()
+    const text = event.text || ''
+    if (!chatId || !telegramMessageId || !direction) {
+      return
+    }
+
+    const conversation = conversationsRef.current.find((item) => item.chatId === chatId)
+    const senderName = direction === 'me' ? 'me' : conversation?.chatName || chatId
+
+    setMessagesByChat((prev) => {
+      const current = prev[chatId] || []
+      if (current.some((item) => item.telegramMessageId === telegramMessageId)) {
+        return prev
+      }
+      const syntheticID = Date.parse(createdAt)
+      const nextMessage: ConversationMessage = {
+        id: Number.isFinite(syntheticID) ? syntheticID : Date.now(),
+        chatId,
+        telegramMessageId,
+        senderName,
+        direction,
+        text,
+        createdAt,
+      }
+      return {
+        ...prev,
+        [chatId]: [...current, nextMessage].sort((a, b) => {
+          if (a.createdAt === b.createdAt) {
+            return a.id - b.id
+          }
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        }),
+      }
+    })
   }
 
   const refreshState = async () => {
@@ -357,6 +673,7 @@ export default function App() {
       setLogs(logPayload.logs || [])
       setAgents(agentsPayload.agents || [])
       setVariables(varsPayload.values || [])
+      await refreshConversations()
     } catch (err) {
       handleRequestError(err)
     } finally {
@@ -366,6 +683,37 @@ export default function App() {
 
   useEffect(() => {
     void refreshState()
+  }, [])
+
+  useEffect(() => {
+    conversationsRef.current = conversations
+  }, [conversations])
+
+  useEffect(() => {
+    selectedChatIdRef.current = selectedChatId
+  }, [selectedChatId])
+
+  useEffect(() => {
+    globalAutoReplyEnabledRef.current = globalAutoReplyEnabled
+  }, [globalAutoReplyEnabled])
+
+  useEffect(() => {
+    syncNotificationPermission()
+    if (typeof window === 'undefined') {
+      return
+    }
+    const handleWindowFocus = () => syncNotificationPermission()
+    const unlockNotificationAudio = () => {
+      void ensureNotificationAudioContext()
+    }
+    window.addEventListener('focus', handleWindowFocus)
+    window.addEventListener('pointerdown', unlockNotificationAudio)
+    window.addEventListener('keydown', unlockNotificationAudio)
+    return () => {
+      window.removeEventListener('focus', handleWindowFocus)
+      window.removeEventListener('pointerdown', unlockNotificationAudio)
+      window.removeEventListener('keydown', unlockNotificationAudio)
+    }
   }, [])
 
   useEffect(() => {
@@ -401,6 +749,43 @@ export default function App() {
       window.localStorage.removeItem('tele_auto_last_phone')
     }
   }, [phone])
+
+  useEffect(() => {
+    if (!adminSession.authenticated || !selectedChatId) {
+      return
+    }
+    void loadConversationMessages(selectedChatId)
+  }, [adminSession.authenticated, selectedChatId])
+
+  useEffect(() => {
+    if (!adminSession.authenticated) {
+      return
+    }
+    const connectedAt = Date.now()
+    const eventSource = new EventSource(`${API_BASE}/api/conversations/stream`, { withCredentials: true })
+    eventSource.addEventListener('conversation', (event) => {
+      let parsed: ConversationStreamEvent | null = null
+      void refreshConversations()
+      try {
+        parsed = JSON.parse((event as MessageEvent).data) as ConversationStreamEvent
+        if (parsed.type === 'message_created') {
+          appendConversationMessage(parsed)
+        }
+        notifyForManualConversation(parsed, connectedAt)
+        if (parsed.chatId && parsed.chatId === selectedChatIdRef.current) {
+          void loadConversationMessages(parsed.chatId)
+        }
+      } catch {
+        if (selectedChatIdRef.current) {
+          void loadConversationMessages(selectedChatIdRef.current)
+        }
+      }
+    })
+    eventSource.onerror = () => {
+      setMessage('Conversation stream disconnected. Retry by refreshing state.')
+    }
+    return () => eventSource.close()
+  }, [adminSession.authenticated])
 
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -504,6 +889,13 @@ export default function App() {
       const raw = (values.AI_CONTEXT_MESSAGE_LIMIT || '').trim()
       if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
         setMessage('Context Message Limit must be a positive number.')
+        return
+      }
+    }
+    if (keys.includes('AUTO_REPLY_DEBOUNCE_SECONDS')) {
+      const raw = (values.AUTO_REPLY_DEBOUNCE_SECONDS || '').trim()
+      if (!/^\d+$/.test(raw)) {
+        setMessage('Reply Debounce Seconds must be 0 or a positive number.')
         return
       }
     }
@@ -706,6 +1098,76 @@ export default function App() {
     setVariableForm({ key: '', type: 'text', value: '' })
   }
 
+  const loadConversationMessages = async (chatId: string) => {
+    if (!chatId) return
+    try {
+      const payload = await apiRequest<ConversationMessagesResponse>(`/api/conversations/${encodeURIComponent(chatId)}/messages?limit=100`)
+      setMessagesByChat((prev) => {
+        const merged = new Map<string, ConversationMessage>()
+        for (const item of prev[chatId] || []) {
+          merged.set(item.telegramMessageId, item)
+        }
+        for (const item of payload.messages || []) {
+          merged.set(item.telegramMessageId, item)
+        }
+        const next = Array.from(merged.values()).sort((a, b) => {
+          if (a.createdAt === b.createdAt) {
+            return a.id - b.id
+          }
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        })
+        return { ...prev, [chatId]: next }
+      })
+    } catch (err) {
+      handleRequestError(err)
+    }
+  }
+
+  const setConversationMode = async (chatId: string, mode: 'auto' | 'manual') => {
+    setBusy(true)
+    setMessage('')
+    try {
+      await apiRequest(`/api/conversations/${encodeURIComponent(chatId)}/mode`, {
+        method: 'PUT',
+        body: JSON.stringify({ mode }),
+      })
+      setMessage(`Conversation mode set to ${mode}`)
+      await refreshConversations()
+    } catch (err) {
+      handleRequestError(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const sendManualReply = async () => {
+    const chatId = selectedChatId
+    const text = manualReplyText.trim()
+    if (!chatId) {
+      setMessage('Select a conversation first.')
+      return
+    }
+    if (!text) {
+      setMessage('Reply text is required.')
+      return
+    }
+    setBusy(true)
+    setMessage('')
+    try {
+      await apiRequest(`/api/conversations/${encodeURIComponent(chatId)}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      })
+      setMessage('Manual reply sent')
+      setManualReplyText('')
+      await Promise.all([refreshConversations(), loadConversationMessages(chatId)])
+    } catch (err) {
+      handleRequestError(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const deleteVariable = async (key: string) => {
     await runConfirmedAction(
       `Delete variable "${key}"?`,
@@ -725,6 +1187,33 @@ export default function App() {
       return blob.includes('orchestrator') || blob.includes('agent_tool_call')
     })
   }, [logs, logMode])
+  const selectedConversation = useMemo(
+    () => conversations.find((item) => item.chatId === selectedChatId),
+    [conversations, selectedChatId],
+  )
+  const activeMessages = useMemo(
+    () => (selectedChatId ? messagesByChat[selectedChatId] || [] : []),
+    [messagesByChat, selectedChatId],
+  )
+
+  useEffect(() => {
+    const latest = activeMessages[activeMessages.length - 1]
+    const latestKey = latest ? `${selectedChatId}:${latest.telegramMessageId}` : `${selectedChatId}:empty`
+    if (latestKey === lastRenderedMessageKeyRef.current) {
+      return
+    }
+    lastRenderedMessageKeyRef.current = latestKey
+    if (typeof window === 'undefined') {
+      return
+    }
+    window.requestAnimationFrame(() => {
+      const el = conversationThreadRef.current
+      if (!el) {
+        return
+      }
+      el.scrollTop = el.scrollHeight
+    })
+  }, [activeMessages, selectedChatId])
 
   const loginAdmin = async () => {
     if (!adminUsername.trim() || !adminPassword) {
@@ -1254,6 +1743,120 @@ export default function App() {
                           </div>
                         </div>
                       </div>
+                      <Card>
+                        <CardHeader>
+                          <CardTitle>Realtime Conversations</CardTitle>
+                          <CardDescription>Human takeover chat panel with per-conversation mode control and manual-chat notifications.</CardDescription>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge variant={globalAutoReplyEnabled ? 'default' : 'destructive'}>
+                              Global Auto Reply: {globalAutoReplyEnabled ? 'ON' : 'OFF'}
+                            </Badge>
+                            {!globalAutoReplyEnabled ? <Badge variant="secondary">Effective mode is Manual for all chats</Badge> : null}
+                            {notificationPermission === 'granted' ? (
+                              <Badge variant="outline">
+                                <BellRing className="mr-1 size-3" /> Manual Chat Notifications On
+                              </Badge>
+                            ) : null}
+                            {notificationPermission === 'default' ? (
+                              <Button size="sm" variant="outline" onClick={() => void requestBrowserNotifications()}>
+                                <BellRing className="mr-1 size-4" /> Enable Notifications
+                              </Button>
+                            ) : null}
+                            {notificationPermission === 'denied' ? (
+                              <Badge variant="secondary">Notifications blocked in browser settings</Badge>
+                            ) : null}
+                            {notificationPermission === 'unsupported' ? (
+                              <Badge variant="secondary">Browser notifications unavailable</Badge>
+                            ) : null}
+                          </div>
+                        </CardHeader>
+                        <CardContent>
+                          <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+                            <div className="max-h-[520px] overflow-auto rounded-lg border border-border/60 bg-background">
+                              {conversations.map((item) => (
+                                <button
+                                  key={item.chatId}
+                                  type="button"
+                                  className={`w-full border-b border-border/40 px-3 py-2 text-left last:border-b-0 ${selectedChatId === item.chatId ? 'bg-primary/10' : 'hover:bg-accent/50'}`}
+                                  onClick={() => setSelectedChatId(item.chatId)}
+                                >
+                                  <p className="truncate text-sm font-medium">{item.chatName || item.chatId}</p>
+                                  <p className="truncate text-xs text-muted-foreground">{item.lastMessage}</p>
+                                  <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                                    <span>{formatLocalTime(item.lastMessageAt)}</span>
+                                    <span>•</span>
+                                    <span>{item.effectiveMode.toUpperCase()}</span>
+                                    {item.unreadIncoming > 0 ? <Badge variant="outline">{item.unreadIncoming}</Badge> : null}
+                                  </div>
+                                </button>
+                              ))}
+                              {conversations.length === 0 ? <p className="p-3 text-sm text-muted-foreground">No conversations yet.</p> : null}
+                            </div>
+
+                            <div className="space-y-3 rounded-lg border border-border/60 bg-background p-3">
+                              {selectedConversation ? (
+                                <>
+                                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                    <div>
+                                      <p className="text-sm font-semibold">{selectedConversation.chatName || selectedConversation.chatId}</p>
+                                      <p className="text-xs text-muted-foreground">{selectedConversation.chatId}</p>
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <Button
+                                        size="sm"
+                                        variant={selectedConversation.mode === 'manual' ? 'default' : 'outline'}
+                                        disabled={busy || !globalAutoReplyEnabled}
+                                        onClick={() => void setConversationMode(selectedConversation.chatId, 'manual')}
+                                      >
+                                        Manual
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant={selectedConversation.mode !== 'manual' ? 'default' : 'outline'}
+                                        disabled={busy || !globalAutoReplyEnabled}
+                                        onClick={() => void setConversationMode(selectedConversation.chatId, 'auto')}
+                                      >
+                                        Auto
+                                      </Button>
+                                      <Badge variant={selectedConversation.effectiveMode === 'manual' ? 'secondary' : 'default'}>
+                                        Effective: {selectedConversation.effectiveMode}
+                                      </Badge>
+                                    </div>
+                                  </div>
+
+                                  <div ref={conversationThreadRef} className="max-h-[340px] overflow-auto rounded-lg border border-border/60 bg-card/30 p-2">
+                                    {activeMessages.map((m) => (
+                                      <div key={`${m.id}-${m.telegramMessageId}`} className={`mb-2 flex ${m.direction === 'me' ? 'justify-end' : 'justify-start'}`}>
+                                        <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${m.direction === 'me' ? 'bg-primary text-primary-foreground' : 'bg-muted'}`}>
+                                          <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                                          <p className="mt-1 text-[10px] opacity-70">{formatLocalTime(m.createdAt)}</p>
+                                        </div>
+                                      </div>
+                                    ))}
+                                    {activeMessages.length === 0 ? <p className="text-xs text-muted-foreground">No messages for this chat yet.</p> : null}
+                                  </div>
+
+                                  <div className="space-y-2">
+                                    <Textarea
+                                      placeholder="Type manual reply..."
+                                      value={manualReplyText}
+                                      onChange={(event) => setManualReplyText(event.target.value)}
+                                      className="min-h-[90px]"
+                                    />
+                                    <div className="flex items-center justify-end">
+                                      <Button size="sm" onClick={() => void sendManualReply()} disabled={busy || !manualReplyText.trim()}>
+                                        Send Human Reply
+                                      </Button>
+                                    </div>
+                                  </div>
+                                </>
+                              ) : (
+                                <p className="text-sm text-muted-foreground">Select a conversation from the left panel.</p>
+                              )}
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
                     </section>
                   ) : null}
 

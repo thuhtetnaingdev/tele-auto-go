@@ -18,15 +18,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
 	"github.com/joho/godotenv"
 
 	"tele-auto-go/internal/adminauth"
 	"tele-auto-go/internal/agents"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/control"
+	"tele-auto-go/internal/conversationstream"
 	"tele-auto-go/internal/logging"
 	"tele-auto-go/internal/logstream"
 	"tele-auto-go/internal/store"
+	tgsvc "tele-auto-go/internal/telegram"
 	"tele-auto-go/internal/tgauth"
 )
 
@@ -34,6 +39,7 @@ type apiServer struct {
 	logger       *slog.Logger
 	manager      *control.Manager
 	logs         *logstream.Hub
+	convEvents   *conversationstream.Hub
 	frontendBase string
 	webDir       string
 	adminAuth    *adminauth.Manager
@@ -59,8 +65,19 @@ func main() {
 		level = "info"
 	}
 	logs := logstream.NewHub(500)
+	convs := conversationstream.NewHub(500)
 	logger := logging.NewWithHub(level, logs)
-	manager := control.NewManager(logger)
+	manager := control.NewManager(logger, func(ev tgsvc.Event) {
+		convs.Publish(conversationstream.Event{
+			Type:      ev.Type,
+			ChatID:    ev.ChatID,
+			MessageID: ev.TelegramMessageID,
+			Direction: ev.Direction,
+			Text:      ev.Text,
+			Mode:      ev.Mode,
+			CreatedAt: ev.CreatedAt,
+		})
+	})
 	admin, err := adminauth.NewManager(adminauth.Config{
 		Username:      strings.TrimSpace(os.Getenv("ADMIN_USERNAME")),
 		PasswordHash:  strings.TrimSpace(os.Getenv("ADMIN_PASSWORD_HASH")),
@@ -78,6 +95,7 @@ func main() {
 		logger:       logger,
 		manager:      manager,
 		logs:         logs,
+		convEvents:   convs,
 		frontendBase: strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")),
 		webDir:       readWebDir(),
 		adminAuth:    admin,
@@ -140,6 +158,9 @@ func main() {
 	mux.HandleFunc("/api/variables/", server.requireAdmin(server.handleVariableByKey))
 	mux.HandleFunc("/api/agents", server.requireAdmin(server.handleAgents))
 	mux.HandleFunc("/api/agents/", server.requireAdmin(server.handleAgentByID))
+	mux.HandleFunc("/api/conversations/stream", server.requireAdmin(server.handleConversationStream))
+	mux.HandleFunc("/api/conversations/", server.requireAdmin(server.handleConversationByID))
+	mux.HandleFunc("/api/conversations", server.requireAdmin(server.handleConversations))
 	mux.HandleFunc("/api/soul", server.requireAdmin(server.handleSoul))
 	mux.HandleFunc("/api/logs", server.requireAdmin(server.handleLogs))
 	mux.HandleFunc("/api/logs/stream", server.requireAdmin(server.handleLogStream))
@@ -587,6 +608,7 @@ var allowedSettingKeys = []string{
 	"OPENAI_API_KEY",
 	"OPENAI_MODEL",
 	"AI_CONTEXT_MESSAGE_LIMIT",
+	"AUTO_REPLY_DEBOUNCE_SECONDS",
 	"AUTO_REPLY_ENABLED",
 }
 
@@ -671,6 +693,13 @@ func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			restarted = true
+		}
+		if _, changed := req.Values["AUTO_REPLY_ENABLED"]; changed {
+			s.convEvents.Publish(conversationstream.Event{
+				Type:      "global_auto_reply_changed",
+				Mode:      strings.TrimSpace(strings.ToLower(env["AUTO_REPLY_ENABLED"])),
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -888,6 +917,223 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type setConversationModeRequest struct {
+	Mode string `json:"mode"`
+}
+
+type sendConversationMessageRequest struct {
+	Text string `json:"text"`
+}
+
+func (s *apiServer) handleConversations(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := 100
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
+				limit = parsed
+			}
+		}
+
+		rows, err := s.db.ListConversationSummaries(r.Context(), limit)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		modes, err := s.db.ListChatModes(r.Context())
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		unresolved := make([]string, 0)
+		for _, row := range rows {
+			if isPlaceholderName(row.ChatName) || strings.EqualFold(strings.TrimSpace(row.ChatName), strings.TrimSpace(row.ChatID)) {
+				unresolved = append(unresolved, row.ChatID)
+			}
+		}
+		resolvedNames := s.resolveConversationNamesViaDialogs(r.Context(), unresolved)
+		globalEnabled := readBoolEnv("AUTO_REPLY_ENABLED", true)
+
+		items := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			if name := strings.TrimSpace(resolvedNames[row.ChatID]); name != "" {
+				row.ChatName = name
+				_ = s.db.BackfillOtherPersonName(r.Context(), row.ChatID, name)
+			}
+			if isPlaceholderName(row.ChatName) {
+				if resolved := s.resolveConversationName(r.Context(), row.ChatID); resolved != "" {
+					row.ChatName = resolved
+					_ = s.db.BackfillOtherPersonName(r.Context(), row.ChatID, resolved)
+				}
+			}
+			mode, hasMode := modes[row.ChatID]
+			effective := effectiveConversationMode(globalEnabled, mode, hasMode)
+			hasManual := hasMode && mode == "manual"
+			items = append(items, map[string]any{
+				"chatId":            row.ChatID,
+				"chatName":          row.ChatName,
+				"lastMessage":       row.LastMessage,
+				"lastMessageAt":     row.LastMessageAt,
+				"unreadIncoming":    row.UnreadIncoming,
+				"effectiveMode":     effective,
+				"hasManualOverride": hasManual,
+				"mode":              mode,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"globalAutoReplyEnabled": globalEnabled,
+			"conversations":          items,
+		})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleConversationByID(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/conversations/"))
+	if rest == "" {
+		errorJSON(w, http.StatusNotFound, errors.New("conversation route not found"))
+		return
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 {
+		errorJSON(w, http.StatusNotFound, errors.New("conversation route not found"))
+		return
+	}
+	chatID := strings.TrimSpace(parts[0])
+	action := strings.TrimSpace(parts[1])
+	if chatID == "" || action == "" {
+		errorJSON(w, http.StatusBadRequest, errors.New("chat id and action are required"))
+		return
+	}
+
+	switch action {
+	case "messages":
+		s.handleConversationMessages(w, r, chatID)
+	case "mode":
+		s.handleConversationMode(w, r, chatID)
+	default:
+		errorJSON(w, http.StatusNotFound, errors.New("conversation route not found"))
+	}
+}
+
+func (s *apiServer) handleConversationMessages(w http.ResponseWriter, r *http.Request, chatID string) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 200 {
+				limit = parsed
+			}
+		}
+		var before int64
+		if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
+			parsed, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || parsed < 0 {
+				errorJSON(w, http.StatusBadRequest, errors.New("invalid before value"))
+				return
+			}
+			before = parsed
+		}
+
+		rows, err := s.db.ListConversationMessages(r.Context(), chatID, limit, before)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		resolvedOtherName := ""
+		for i := range rows {
+			if rows[i].Direction == "other_person" && isPlaceholderName(rows[i].SenderName) {
+				if resolvedOtherName == "" {
+					resolvedMap := s.resolveConversationNamesViaDialogs(r.Context(), []string{chatID})
+					resolvedOtherName = strings.TrimSpace(resolvedMap[chatID])
+					if resolvedOtherName == "" {
+						resolvedOtherName = s.resolveConversationName(r.Context(), chatID)
+					}
+					if resolvedOtherName != "" {
+						_ = s.db.BackfillOtherPersonName(r.Context(), chatID, resolvedOtherName)
+					}
+				}
+				if resolvedOtherName != "" {
+					rows[i].SenderName = resolvedOtherName
+				}
+			}
+		}
+		nextBefore := int64(0)
+		if len(rows) > 0 {
+			nextBefore = rows[0].ID
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"chatId":       chatID,
+			"messages":     rows,
+			"nextBefore":   nextBefore,
+			"hasMore":      len(rows) == limit,
+			"messageCount": len(rows),
+		})
+	case http.MethodPost:
+		var req sendConversationMessageRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		text := strings.TrimSpace(req.Text)
+		if text == "" {
+			errorJSON(w, http.StatusBadRequest, errors.New("text is required"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		record, err := s.manager.SendConversationMessage(ctx, chatID, text)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"message": record,
+		})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleConversationMode(w http.ResponseWriter, r *http.Request, chatID string) {
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w)
+		return
+	}
+	var req setConversationModeRequest
+	if err := decodeJSON(r, &req); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	mode := strings.TrimSpace(strings.ToLower(req.Mode))
+	if mode != "auto" && mode != "manual" {
+		errorJSON(w, http.StatusBadRequest, errors.New("mode must be auto or manual"))
+		return
+	}
+	if err := s.db.UpsertChatMode(r.Context(), chatID, mode); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	globalEnabled := readBoolEnv("AUTO_REPLY_ENABLED", true)
+	effective := effectiveConversationMode(globalEnabled, mode, true)
+	s.convEvents.Publish(conversationstream.Event{
+		Type:      "mode_changed",
+		ChatID:    chatID,
+		Mode:      mode,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"chatId":            chatID,
+		"mode":              mode,
+		"effectiveMode":     effective,
+		"globalAutoEnabled": globalEnabled,
+	})
+}
+
 type updateSoulRequest struct {
 	Content string `json:"content"`
 }
@@ -1013,6 +1259,55 @@ func (s *apiServer) handleLogStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *apiServer) handleConversationStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		errorJSON(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	for _, entry := range s.convEvents.Snapshot(200) {
+		if err := writeSSE(w, "conversation", entry); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
+
+	ch, unsub := s.convEvents.Subscribe()
+	defer unsub()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case entry, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := writeSSE(w, "conversation", entry); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func (s *apiServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.isAdminAuthenticated(r) {
@@ -1109,6 +1404,121 @@ func readWebDir() string {
 		return raw
 	}
 	return "./web"
+}
+
+func effectiveConversationMode(globalEnabled bool, mode string, hasMode bool) string {
+	if !globalEnabled {
+		return "manual"
+	}
+	if hasMode && strings.TrimSpace(strings.ToLower(mode)) == "manual" {
+		return "manual"
+	}
+	return "auto"
+}
+
+func isPlaceholderName(name string) bool {
+	n := strings.TrimSpace(strings.ToLower(name))
+	if n == "" {
+		return true
+	}
+	return n == "other_person" || n == "unknown"
+}
+
+func (s *apiServer) resolveConversationName(ctx context.Context, chatID string) string {
+	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	name, err := s.manager.ResolveConversationName(cctx, chatID)
+	if err != nil {
+		return ""
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return name
+}
+
+func (s *apiServer) resolveConversationNamesViaDialogs(ctx context.Context, chatIDs []string) map[string]string {
+	out := map[string]string{}
+	if len(chatIDs) == 0 {
+		return out
+	}
+	userIDs := map[int64]string{}
+	for _, chatID := range chatIDs {
+		chatID = strings.TrimSpace(chatID)
+		if !strings.HasPrefix(chatID, "user:") {
+			continue
+		}
+		raw := strings.TrimSpace(strings.TrimPrefix(chatID, "user:"))
+		uid, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || uid <= 0 {
+			continue
+		}
+		userIDs[uid] = chatID
+	}
+	if len(userIDs) == 0 {
+		return out
+	}
+
+	cfg, err := config.LoadForLogin()
+	if err != nil {
+		return out
+	}
+	client := telegram.NewClient(cfg.Telegram.APIID, cfg.Telegram.APIHash, telegram.Options{
+		SessionStorage: &session.FileStorage{Path: cfg.Telegram.SessionFile},
+	})
+	runCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+
+	_ = client.Run(runCtx, func(ctx context.Context) error {
+		status, err := client.Auth().Status(ctx)
+		if err != nil || !status.Authorized {
+			return err
+		}
+		raw := tg.NewClient(client)
+		resp, err := raw.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetDate: 0,
+			OffsetID:   0,
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      100,
+			Hash:       0,
+		})
+		if err != nil {
+			return err
+		}
+		modified, ok := resp.AsModified()
+		if !ok {
+			return nil
+		}
+		for _, u := range modified.GetUsers() {
+			usr, ok := u.AsNotEmpty()
+			if !ok {
+				continue
+			}
+			chatID, wanted := userIDs[usr.ID]
+			if !wanted {
+				continue
+			}
+			first, _ := usr.GetFirstName()
+			last, _ := usr.GetLastName()
+			name := strings.TrimSpace(strings.TrimSpace(first + " " + last))
+			if name == "" {
+				if username := strings.TrimSpace(usr.Username); username != "" {
+					name = "@" + username
+				}
+			}
+			if name == "" {
+				if phone := strings.TrimSpace(usr.Phone); phone != "" {
+					name = "+" + phone
+				}
+			}
+			if name != "" {
+				out[chatID] = name
+			}
+		}
+		return nil
+	})
+	return out
 }
 
 func readBoolEnv(name string, fallback bool) bool {

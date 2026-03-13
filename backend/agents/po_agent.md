@@ -9,6 +9,10 @@ tools:
 - api_call
 variables:
 - TOKEN
+visibility: private
+allow_users:
+- fyuanjjk
+- morpheus_enles
 temperature: 0.35
 ---
 

@@ -28,6 +28,7 @@ type Manager struct {
 	mu sync.Mutex
 
 	logger *slog.Logger
+	onEvent func(tgsvc.Event)
 
 	runID int64
 
@@ -36,10 +37,11 @@ type Manager struct {
 	done      chan struct{}
 	startedAt time.Time
 	lastError string
+	service   *tgsvc.Service
 }
 
-func NewManager(logger *slog.Logger) *Manager {
-	return &Manager{logger: logger}
+func NewManager(logger *slog.Logger, onEvent func(tgsvc.Event)) *Manager {
+	return &Manager{logger: logger, onEvent: onEvent}
 }
 
 func (m *Manager) Start() error {
@@ -75,7 +77,7 @@ func (m *Manager) Start() error {
 		cfg.OpenAI.MaxTokens,
 		m.logger,
 	)
-	telegramService := tgsvc.NewService(cfg, m.logger, db, aiClient, soulPrompt)
+	telegramService := tgsvc.NewService(cfg, m.logger, db, aiClient, soulPrompt, m.onEvent)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -91,6 +93,7 @@ func (m *Manager) Start() error {
 	m.running = true
 	m.cancel = cancel
 	m.done = done
+	m.service = telegramService
 	m.startedAt = time.Now().UTC()
 	m.lastError = ""
 	m.runID++
@@ -108,6 +111,7 @@ func (m *Manager) Start() error {
 			m.running = false
 			m.cancel = nil
 			m.done = nil
+			m.service = nil
 			m.startedAt = time.Time{}
 		}
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -142,6 +146,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 	m.running = false
 	m.cancel = nil
 	m.done = nil
+	m.service = nil
 	m.startedAt = time.Time{}
 	m.mu.Unlock()
 
@@ -182,4 +187,28 @@ func (m *Manager) setLastError(err error) {
 	m.mu.Lock()
 	m.lastError = err.Error()
 	m.mu.Unlock()
+}
+
+func (m *Manager) SendConversationMessage(ctx context.Context, chatID, text string) (store.MessageRecord, error) {
+	m.mu.Lock()
+	svc := m.service
+	running := m.running
+	m.mu.Unlock()
+
+	if !running || svc == nil {
+		return store.MessageRecord{}, fmt.Errorf("telegram worker is not running")
+	}
+	return svc.SendText(ctx, chatID, text)
+}
+
+func (m *Manager) ResolveConversationName(ctx context.Context, chatID string) (string, error) {
+	m.mu.Lock()
+	svc := m.service
+	running := m.running
+	m.mu.Unlock()
+
+	if !running || svc == nil {
+		return "", fmt.Errorf("telegram worker is not running")
+	}
+	return svc.ResolveChatDisplayName(ctx, chatID)
 }

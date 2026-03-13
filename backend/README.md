@@ -120,6 +120,7 @@ make build-control
 - `WEB_DIR` (optional): static frontend dir to serve (default `./web`)
 - `AGENTS_DIR` (optional): markdown agents dir (default `./agents`)
 - `AI_CONTEXT_MESSAGE_LIMIT` (optional): conversation context message count (default `20`)
+- `AUTO_REPLY_DEBOUNCE_SECONDS` (optional): wait window before sending one grouped LLM request for rapid-fire incoming messages (default `10`, set `0` to disable)
 - `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_SALT`, `ADMIN_SESSION_SECRET` (required)
 - `ADMIN_SESSION_TTL_HOURS` (default `168`)
 - `COOKIE_SECURE` (`true` when running behind HTTPS)

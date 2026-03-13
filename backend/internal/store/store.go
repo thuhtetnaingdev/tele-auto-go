@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,13 +14,31 @@ import (
 )
 
 type MessageRecord struct {
-	ChatID            string
-	TelegramMessageID string
-	SenderID          string
-	SenderName        string
-	Direction         string
-	Text              string
-	CreatedAt         time.Time
+	ChatID            string    `json:"chatId"`
+	TelegramMessageID string    `json:"telegramMessageId"`
+	SenderID          string    `json:"senderId,omitempty"`
+	SenderName        string    `json:"senderName,omitempty"`
+	Direction         string    `json:"direction"`
+	Text              string    `json:"text"`
+	CreatedAt         time.Time `json:"createdAt"`
+}
+
+type ConversationSummary struct {
+	ChatID         string `json:"chatId"`
+	ChatName       string `json:"chatName"`
+	LastMessage    string `json:"lastMessage"`
+	LastMessageAt  string `json:"lastMessageAt"`
+	UnreadIncoming int    `json:"unreadIncoming"`
+}
+
+type ConversationMessage struct {
+	ID                int64  `json:"id"`
+	ChatID            string `json:"chatId"`
+	TelegramMessageID string `json:"telegramMessageId"`
+	SenderName        string `json:"senderName"`
+	Direction         string `json:"direction"`
+	Text              string `json:"text"`
+	CreatedAt         string `json:"createdAt"`
 }
 
 type Store struct {
@@ -103,6 +122,12 @@ CREATE TABLE IF NOT EXISTS global_variables (
   key TEXT PRIMARY KEY,
   type TEXT NOT NULL,
   value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_modes (
+  chat_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
@@ -293,6 +318,250 @@ VALUES(?,?,?,?,?,?,?)
 	}
 
 	return tx.Commit()
+}
+
+func (s *Store) SaveMessage(ctx context.Context, row MessageRecord) error {
+	return s.SaveMessages(ctx, []MessageRecord{row})
+}
+
+func (s *Store) ListConversationSummaries(ctx context.Context, limit int) ([]ConversationSummary, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+WITH latest AS (
+	SELECT chat_id, MAX(id) AS last_id
+	FROM messages
+	GROUP BY chat_id
+)
+SELECT
+	l.chat_id,
+	COALESCE(
+		(
+			SELECT m2.sender_name
+			FROM messages m2
+			WHERE m2.chat_id = l.chat_id
+			  AND m2.direction = 'other_person'
+			  AND TRIM(COALESCE(m2.sender_name, '')) <> ''
+			  AND LOWER(TRIM(COALESCE(m2.sender_name, ''))) <> 'other_person'
+			ORDER BY m2.id DESC
+			LIMIT 1
+		),
+		l.chat_id
+	) AS chat_name,
+	m.text AS last_message,
+	m.created_at AS last_message_at,
+	COALESCE((
+		SELECT COUNT(1)
+		FROM messages i
+		WHERE i.chat_id = l.chat_id
+		  AND i.direction = 'other_person'
+		  AND i.id > COALESCE((
+			SELECT MAX(me.id)
+			FROM messages me
+			WHERE me.chat_id = l.chat_id
+			  AND me.direction = 'me'
+		  ), 0)
+	), 0) AS unread_incoming
+FROM latest l
+JOIN messages m ON m.id = l.last_id
+ORDER BY m.id DESC
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ConversationSummary, 0, limit)
+	for rows.Next() {
+		var item ConversationSummary
+		if err := rows.Scan(
+			&item.ChatID,
+			&item.ChatName,
+			&item.LastMessage,
+			&item.LastMessageAt,
+			&item.UnreadIncoming,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListConversationMessages(ctx context.Context, chatID string, limit int, beforeID int64) ([]ConversationMessage, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil, fmt.Errorf("chat_id is required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT
+  m.id,
+  m.chat_id,
+  m.telegram_message_id,
+  CASE
+    WHEN m.direction = 'me' THEN 'me'
+    WHEN TRIM(COALESCE(m.sender_name, '')) = '' OR LOWER(TRIM(COALESCE(m.sender_name, ''))) = 'other_person'
+      THEN COALESCE((
+        SELECT m2.sender_name
+        FROM messages m2
+        WHERE m2.chat_id = m.chat_id
+          AND m2.direction = 'other_person'
+          AND TRIM(COALESCE(m2.sender_name, '')) <> ''
+          AND LOWER(TRIM(COALESCE(m2.sender_name, ''))) <> 'other_person'
+        ORDER BY m2.id DESC
+        LIMIT 1
+      ), m.chat_id)
+    ELSE m.sender_name
+  END AS sender_name,
+  m.direction,
+  m.text,
+  m.created_at
+FROM messages m
+WHERE m.chat_id = ?
+  AND (? <= 0 OR m.id < ?)
+ORDER BY m.id DESC
+LIMIT ?
+`, chatID, beforeID, beforeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	desc := make([]ConversationMessage, 0, limit)
+	for rows.Next() {
+		var item ConversationMessage
+		if err := rows.Scan(
+			&item.ID,
+			&item.ChatID,
+			&item.TelegramMessageID,
+			&item.SenderName,
+			&item.Direction,
+			&item.Text,
+			&item.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		desc = append(desc, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// UI renders oldest -> newest in a single pass.
+	out := make([]ConversationMessage, len(desc))
+	for i := range desc {
+		out[i] = desc[len(desc)-1-i]
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertChatMode(ctx context.Context, chatID, mode string) error {
+	chatID = strings.TrimSpace(chatID)
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	if mode != "auto" && mode != "manual" {
+		return fmt.Errorf("invalid mode: %s", mode)
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO chat_modes(chat_id, mode, updated_at)
+VALUES(?,?,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  mode=excluded.mode,
+  updated_at=excluded.updated_at
+`, chatID, mode, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) GetChatMode(ctx context.Context, chatID string) (string, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return "", false, fmt.Errorf("chat_id is required")
+	}
+	var mode string
+	err := s.db.QueryRowContext(ctx, `
+SELECT mode
+FROM chat_modes
+WHERE chat_id = ?
+`, chatID).Scan(&mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode != "auto" && mode != "manual" {
+		return "", false, fmt.Errorf("invalid chat mode in store for %s", chatID)
+	}
+	return mode, true, nil
+}
+
+func (s *Store) ListChatModes(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT chat_id, mode
+FROM chat_modes
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var chatID string
+		var mode string
+		if err := rows.Scan(&chatID, &mode); err != nil {
+			return nil, err
+		}
+		mode = strings.TrimSpace(strings.ToLower(mode))
+		if mode != "auto" && mode != "manual" {
+			continue
+		}
+		out[strings.TrimSpace(chatID)] = mode
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) BackfillOtherPersonName(ctx context.Context, chatID, displayName string) error {
+	chatID = strings.TrimSpace(chatID)
+	displayName = strings.TrimSpace(displayName)
+	if chatID == "" || displayName == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE messages
+SET sender_name = ?
+WHERE chat_id = ?
+  AND direction = 'other_person'
+  AND (
+    TRIM(COALESCE(sender_name, '')) = ''
+    OR LOWER(TRIM(COALESCE(sender_name, ''))) = 'other_person'
+    OR LOWER(TRIM(COALESCE(sender_name, ''))) = 'unknown'
+  )
+`, displayName, chatID)
+	return err
 }
 
 func (s *Store) CreateAutoReply(

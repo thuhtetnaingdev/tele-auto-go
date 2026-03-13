@@ -37,6 +37,7 @@ type Service struct {
 	ai         *ai.Client
 	soulPrompt string
 	orch       *orchestrator.Engine
+	onEvent    func(Event)
 
 	dispatcher tg.UpdateDispatcher
 	client     *telegram.Client
@@ -45,6 +46,35 @@ type Service struct {
 	peerMgr    *peers.Manager
 
 	inFlight sync.Map
+
+	debounceMu     sync.Mutex
+	debounceTimers map[string]*debounceState
+	runCtx         context.Context
+}
+
+type Event struct {
+	Type              string
+	ChatID            string
+	TelegramMessageID string
+	Direction         string
+	Text              string
+	Mode              string
+	CreatedAt         string
+}
+
+type autoReplyRequest struct {
+	ChatID           string
+	ChatName         string
+	LatestIncoming   string
+	TriggerMessageID string
+	TriggerUserID    string
+	TriggerUsername  string
+}
+
+type debounceState struct {
+	seq     uint64
+	timer   *time.Timer
+	pending autoReplyRequest
 }
 
 type historyEntry struct {
@@ -57,7 +87,7 @@ type historyEntry struct {
 	CreatedAt  time.Time
 }
 
-func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClient *ai.Client, soulPrompt string) *Service {
+func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClient *ai.Client, soulPrompt string, onEvent func(Event)) *Service {
 	var orch *orchestrator.Engine
 	agentMgr, err := agents.NewManager(cfg.AgentsDir, logger)
 	if err != nil {
@@ -67,16 +97,21 @@ func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClien
 	}
 
 	return &Service{
-		cfg:        cfg,
-		logger:     logger,
-		db:         db,
-		ai:         aiClient,
-		soulPrompt: soulPrompt,
-		orch:       orch,
+		cfg:            cfg,
+		logger:         logger,
+		db:             db,
+		ai:             aiClient,
+		soulPrompt:     soulPrompt,
+		orch:           orch,
+		onEvent:        onEvent,
+		debounceTimers: make(map[string]*debounceState),
 	}
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	s.runCtx = ctx
+	defer s.cancelDebouncedReplies()
+
 	s.dispatcher = tg.NewUpdateDispatcher()
 	s.dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, upd *tg.UpdateNewMessage) error {
 		if err := s.handleIncoming(ctx, entities, upd); err != nil {
@@ -163,11 +198,6 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		"peer_type", fmt.Sprintf("%T", msg.GetPeerID()),
 		"text_len", len(strings.TrimSpace(msg.Message)),
 	)
-	if msg.Out {
-		s.logger.Debug("Ignoring outgoing message update", "message_id", msg.ID)
-		return nil
-	}
-
 	peerID := msg.GetPeerID()
 	if peerID == nil {
 		s.logger.Debug("Ignoring message without peer", "message_id", msg.ID)
@@ -185,6 +215,9 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	if s.cfg.AutoReply.IgnoreBots && s.isPeerBot(ctx, entities, peerID) {
 		s.logger.Debug("Ignoring bot message", "message_id", msg.ID)
 		return nil
+	}
+	if msg.Out {
+		return s.persistOutgoing(ctx, msg, peerID)
 	}
 
 	latestIncomingText := util.NormalizeSpace(msg.Message)
@@ -237,6 +270,15 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	if !containsMessageID(history, msg.ID) {
 		history = append(history, s.entryFromTrigger(msg))
 	}
+	chatName := s.chatNameFromPeer(ctx, entities, peerID)
+	for i := range history {
+		if history[i].Direction == "other_person" && strings.TrimSpace(history[i].SenderName) == "other_person" {
+			history[i].SenderName = chatName
+		}
+		if history[i].Direction == "me" {
+			history[i].SenderName = "me"
+		}
+	}
 	sort.Slice(history, func(i, j int) bool { return history[i].MessageID < history[j].MessageID })
 	if len(history) > s.cfg.ContextLimit {
 		history = history[len(history)-s.cfg.ContextLimit:]
@@ -245,6 +287,14 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	if err := s.db.SaveMessages(ctx, toStoreRows(history)); err != nil {
 		s.logger.Warn("failed to save message history", "error", err.Error())
 	}
+	s.publishEvent(Event{
+		Type:              "message_created",
+		ChatID:            chatID,
+		TelegramMessageID: triggerID,
+		Direction:         "other_person",
+		Text:              latestIncomingText,
+		CreatedAt:         time.Now().UTC().Format(time.RFC3339Nano),
+	})
 
 	if s.cfg.AutoReply.LogContext {
 		lines := formatContextLines(history)
@@ -265,35 +315,168 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 			"context_limit", s.cfg.ContextLimit,
 		)
 	}
+	req := autoReplyRequest{
+		ChatID:           chatID,
+		ChatName:         chatName,
+		LatestIncoming:   latestIncomingText,
+		TriggerMessageID: triggerID,
+		TriggerUserID:    senderIDFromMessagePeer(msg.GetFromID),
+		TriggerUsername:  s.usernameFromMessage(ctx, entities, msg),
+	}
+	if req.TriggerUserID == "" {
+		if peerUser, ok := msg.GetPeerID().(*tg.PeerUser); ok {
+			req.TriggerUserID = strconv.FormatInt(peerUser.UserID, 10)
+		}
+	}
+	if s.cfg.AutoReply.DebounceSeconds > 0 {
+		if !s.shouldAutoReply(ctx, chatID) {
+			return nil
+		}
+		s.scheduleDebouncedAutoReply(req)
+		return nil
+	}
+	return s.executeAutoReply(ctx, req)
+}
 
-	autoReplyID, err := s.db.CreateAutoReply(ctx, chatID, triggerID, len(history), s.cfg.OpenAI.Model)
+func truncatePreview(text string, max int) string {
+	v := util.NormalizeSpace(text)
+	if max <= 0 || len(v) <= max {
+		return v
+	}
+	return v[:max] + "...(truncated)"
+}
+
+func (s *Service) scheduleDebouncedAutoReply(req autoReplyRequest) {
+	window := time.Duration(s.cfg.AutoReply.DebounceSeconds) * time.Second
+	if window <= 0 {
+		return
+	}
+
+	s.debounceMu.Lock()
+	state, ok := s.debounceTimers[req.ChatID]
+	if !ok {
+		state = &debounceState{}
+		s.debounceTimers[req.ChatID] = state
+	}
+	state.seq++
+	seq := state.seq
+	state.pending = req
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	state.timer = time.AfterFunc(window, func() {
+		s.flushDebouncedAutoReply(req.ChatID, seq)
+	})
+	s.debounceMu.Unlock()
+
+	s.logger.Info(
+		"Auto-reply debounced",
+		"chat_id", req.ChatID,
+		"message_id", req.TriggerMessageID,
+		"debounce_seconds", s.cfg.AutoReply.DebounceSeconds,
+	)
+}
+
+func (s *Service) flushDebouncedAutoReply(chatID string, seq uint64) {
+	s.debounceMu.Lock()
+	state, ok := s.debounceTimers[chatID]
+	if !ok || state.seq != seq {
+		s.debounceMu.Unlock()
+		return
+	}
+	req := state.pending
+	delete(s.debounceTimers, chatID)
+	s.debounceMu.Unlock()
+
+	if s.runCtx == nil || s.runCtx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.runCtx, 2*time.Minute)
+	defer cancel()
+	if err := s.executeAutoReply(ctx, req); err != nil && !errors.Is(err, context.Canceled) {
+		s.logger.Error(
+			"Debounced auto-reply failed",
+			"chat_id", req.ChatID,
+			"message_id", req.TriggerMessageID,
+			"error", err.Error(),
+		)
+	}
+}
+
+func (s *Service) cancelDebouncedReplies() {
+	s.debounceMu.Lock()
+	defer s.debounceMu.Unlock()
+	for chatID, state := range s.debounceTimers {
+		if state.timer != nil {
+			state.timer.Stop()
+		}
+		delete(s.debounceTimers, chatID)
+	}
+}
+
+func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) error {
+	inputPeer, err := s.inputPeerFromChatID(ctx, req.ChatID)
+	if err != nil {
+		return fmt.Errorf("resolve input peer: %w", err)
+	}
+
+	historyResult, err := s.raw.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:  inputPeer,
+		Limit: s.cfg.ContextLimit,
+	})
+	if err != nil {
+		return fmt.Errorf("messages.getHistory: %w", err)
+	}
+	modifiedHistory, ok := historyResult.AsModified()
+	if !ok {
+		return fmt.Errorf("messages.getHistory returned unmodified result")
+	}
+
+	history := s.normalizeHistory(modifiedHistory.GetMessages())
+	for i := range history {
+		if history[i].Direction == "other_person" && strings.TrimSpace(history[i].SenderName) == "other_person" {
+			history[i].SenderName = req.ChatName
+		}
+		if history[i].Direction == "me" {
+			history[i].SenderName = "me"
+		}
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].MessageID < history[j].MessageID })
+	if len(history) > s.cfg.ContextLimit {
+		history = history[len(history)-s.cfg.ContextLimit:]
+	}
+	if err := s.db.SaveMessages(ctx, toStoreRows(history)); err != nil {
+		s.logger.Warn("failed to save message history before auto-reply", "error", err.Error())
+	}
+
+	autoReplyID, err := s.db.CreateAutoReply(ctx, req.ChatID, req.TriggerMessageID, len(history), s.cfg.OpenAI.Model)
 	if err != nil {
 		return fmt.Errorf("create auto reply row: %w", err)
 	}
 
-	if !s.cfg.AutoReply.Enabled {
-		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_disabled", "AUTO_REPLY_ENABLED=false")
+	if !s.shouldAutoReply(ctx, req.ChatID) {
+		mode, ok, _ := s.db.GetChatMode(ctx, req.ChatID)
+		status := "skipped_disabled"
+		errMsg := "AUTO_REPLY_ENABLED=false"
+		if s.cfg.AutoReply.Enabled && ok && mode == "manual" {
+			status = "skipped_manual_mode"
+			errMsg = "chat mode is manual"
+		}
+		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, status, errMsg)
 		return nil
 	}
 
 	reply := ""
 	replySource := "none"
 	if s.orch != nil {
-		triggerUserID := senderIDFromMessagePeer(msg.GetFromID)
-		if triggerUserID == "" {
-			if peerUser, ok := msg.GetPeerID().(*tg.PeerUser); ok {
-				triggerUserID = strconv.FormatInt(peerUser.UserID, 10)
-			}
-		}
-		triggerUsername := s.usernameFromMessage(ctx, entities, msg)
 		reply, err = s.orch.Handle(ctx, orchestrator.MessageContext{
-			ChatID:          chatID,
-			ChatName:        s.chatNameFromPeer(ctx, entities, peerID),
-			LatestIncoming:  latestIncomingText,
+			ChatID:          req.ChatID,
+			ChatName:        req.ChatName,
+			LatestIncoming:  req.LatestIncoming,
 			RecentMessages:  toContextLines(history),
-			TriggerMessage:  triggerID,
-			TriggerUserID:   triggerUserID,
-			TriggerUsername: triggerUsername,
+			TriggerMessage:  req.TriggerMessageID,
+			TriggerUserID:   req.TriggerUserID,
+			TriggerUsername: req.TriggerUsername,
 		}, s.soulPrompt)
 		if err != nil {
 			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
@@ -301,18 +484,19 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 			replySource = "orchestrator"
 		}
 	} else {
-		s.logger.Warn("orchestrator unavailable; fallback to legacy reply", "chat_id", chatID, "message_id", triggerID)
+		s.logger.Warn("orchestrator unavailable; fallback to legacy reply", "chat_id", req.ChatID, "message_id", req.TriggerMessageID)
 	}
 	if strings.TrimSpace(reply) == "" {
-		s.logger.Info("using legacy ai fallback",
-			"chat_id", chatID,
-			"message_id", triggerID,
+		s.logger.Info(
+			"using legacy ai fallback",
+			"chat_id", req.ChatID,
+			"message_id", req.TriggerMessageID,
 			"reason", "orchestrator_empty_or_unavailable",
 		)
 		systemPrompt, userPrompt := contextbuilder.Build(
-			s.chatNameFromPeer(ctx, entities, peerID),
+			req.ChatName,
 			toContextLines(history),
-			latestIncomingText,
+			req.LatestIncoming,
 			s.soulPrompt,
 		)
 		reply, err = s.ai.GenerateReply(ctx, systemPrompt, userPrompt)
@@ -324,7 +508,7 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	}
 	if strings.TrimSpace(reply) == "" {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_empty", "AI returned blank text")
-		s.logger.Info("No reply sent", "chat_id", chatID, "message_id", triggerID, "reason", "blank_ai_output")
+		s.logger.Info("No reply sent", "chat_id", req.ChatID, "message_id", req.TriggerMessageID, "reason", "blank_ai_output")
 		return nil
 	}
 
@@ -333,20 +517,29 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "canceled_before_send", err.Error())
 		return nil
 	}
-	s.logger.Debug("Human-like delay completed", "delay_ms", d.Milliseconds(), "chat_id", chatID, "message_id", triggerID)
+	s.logger.Debug("Human-like delay completed", "delay_ms", d.Milliseconds(), "chat_id", req.ChatID, "message_id", req.TriggerMessageID)
 
-	if _, err := s.sender.To(inputPeer).Text(ctx, reply); err != nil {
+	sentRecord, err := s.sendAndPersist(ctx, inputPeer, req.ChatID, "me", reply)
+	if err != nil {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "send_failed", err.Error())
 		return fmt.Errorf("send reply: %w", err)
 	}
 	if err := s.db.MarkAutoReplySent(ctx, autoReplyID, reply); err != nil {
 		s.logger.Warn("failed to mark auto reply sent", "error", err.Error())
 	}
+	s.publishEvent(Event{
+		Type:              "message_created",
+		ChatID:            sentRecord.ChatID,
+		TelegramMessageID: sentRecord.TelegramMessageID,
+		Direction:         sentRecord.Direction,
+		Text:              sentRecord.Text,
+		CreatedAt:         sentRecord.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
 
 	s.logger.Info(
 		"Auto-reply sent",
-		"chat_id", chatID,
-		"message_id", triggerID,
+		"chat_id", req.ChatID,
+		"message_id", req.TriggerMessageID,
 		"context_count", len(history),
 		"source", replySource,
 		"reply_preview", truncatePreview(reply, 220),
@@ -354,12 +547,186 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	return nil
 }
 
-func truncatePreview(text string, max int) string {
-	v := util.NormalizeSpace(text)
-	if max <= 0 || len(v) <= max {
-		return v
+func (s *Service) publishEvent(ev Event) {
+	if s.onEvent == nil {
+		return
 	}
-	return v[:max] + "...(truncated)"
+	s.onEvent(ev)
+}
+
+func (s *Service) shouldAutoReply(ctx context.Context, chatID string) bool {
+	if !s.cfg.AutoReply.Enabled {
+		return false
+	}
+	mode, ok, err := s.db.GetChatMode(ctx, chatID)
+	if err != nil {
+		s.logger.Warn("failed to load chat mode; using default auto mode", "chat_id", chatID, "error", err.Error())
+		return true
+	}
+	if ok && mode == "manual" {
+		return false
+	}
+	return true
+}
+
+func (s *Service) persistOutgoing(ctx context.Context, msg *tg.Message, peerID tg.PeerClass) error {
+	text := util.NormalizeSpace(msg.Message)
+	if text == "" {
+		text = "(non-text message)"
+	}
+	row := store.MessageRecord{
+		ChatID:            chatIDFromPeer(peerID),
+		TelegramMessageID: strconv.Itoa(msg.ID),
+		SenderID:          senderIDFromMessagePeer(msg.GetFromID),
+		SenderName:        "me",
+		Direction:         "me",
+		Text:              text,
+		CreatedAt:         time.Unix(int64(msg.GetDate()), 0).UTC(),
+	}
+	if err := s.db.SaveMessage(ctx, row); err != nil {
+		return err
+	}
+	s.publishEvent(Event{
+		Type:              "message_created",
+		ChatID:            row.ChatID,
+		TelegramMessageID: row.TelegramMessageID,
+		Direction:         row.Direction,
+		Text:              row.Text,
+		CreatedAt:         row.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
+	return nil
+}
+
+func (s *Service) SendText(ctx context.Context, chatID, text string) (store.MessageRecord, error) {
+	chatID = strings.TrimSpace(chatID)
+	text = util.NormalizeSpace(text)
+	if chatID == "" {
+		return store.MessageRecord{}, fmt.Errorf("chat_id is required")
+	}
+	if text == "" {
+		return store.MessageRecord{}, fmt.Errorf("text is required")
+	}
+	inputPeer, err := s.inputPeerFromChatID(ctx, chatID)
+	if err != nil {
+		return store.MessageRecord{}, err
+	}
+	rec, err := s.sendAndPersist(ctx, inputPeer, chatID, "me", text)
+	if err != nil {
+		return store.MessageRecord{}, err
+	}
+	s.publishEvent(Event{
+		Type:              "message_created",
+		ChatID:            rec.ChatID,
+		TelegramMessageID: rec.TelegramMessageID,
+		Direction:         rec.Direction,
+		Text:              rec.Text,
+		CreatedAt:         rec.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
+	return rec, nil
+}
+
+func (s *Service) ResolveChatDisplayName(ctx context.Context, chatID string) (string, error) {
+	chatID = strings.TrimSpace(chatID)
+	if !strings.HasPrefix(chatID, "user:") {
+		return chatID, nil
+	}
+	rawUserID := strings.TrimSpace(strings.TrimPrefix(chatID, "user:"))
+	userID, err := strconv.ParseInt(rawUserID, 10, 64)
+	if err != nil || userID <= 0 {
+		return chatID, nil
+	}
+	if name := s.displayNameFromPeerCache(ctx, userID); name != "" {
+		return name, nil
+	}
+	if name := s.displayNameFromDialogs(ctx, userID); name != "" {
+		return name, nil
+	}
+	return chatID, nil
+}
+
+func (s *Service) displayNameFromPeerCache(ctx context.Context, userID int64) string {
+	resolved, err := s.peerMgr.ResolveUserID(ctx, userID)
+	if err != nil {
+		return ""
+	}
+	if name := strings.TrimSpace(resolved.VisibleName()); name != "" {
+		return name
+	}
+	if username, ok := resolved.Username(); ok {
+		if username = strings.TrimSpace(username); username != "" {
+			return "@" + username
+		}
+	}
+	return ""
+}
+
+func (s *Service) displayNameFromDialogs(ctx context.Context, userID int64) string {
+	resp, err := s.raw.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+		OffsetDate: 0,
+		OffsetID:   0,
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      100,
+		Hash:       0,
+	})
+	if err != nil {
+		return ""
+	}
+	modified, ok := resp.AsModified()
+	if !ok {
+		return ""
+	}
+	for _, u := range modified.GetUsers() {
+		usr, ok := u.AsNotEmpty()
+		if !ok || usr.ID != userID {
+			continue
+		}
+		first, _ := usr.GetFirstName()
+		last, _ := usr.GetLastName()
+		if full := strings.TrimSpace(strings.TrimSpace(first + " " + last)); full != "" {
+			return full
+		}
+		if username := strings.TrimSpace(usr.Username); username != "" {
+			return "@" + username
+		}
+	}
+	return ""
+}
+
+func (s *Service) sendAndPersist(ctx context.Context, inputPeer tg.InputPeerClass, chatID, senderName, text string) (store.MessageRecord, error) {
+	if _, err := s.sender.To(inputPeer).Text(ctx, text); err != nil {
+		return store.MessageRecord{}, err
+	}
+	msgID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	createdAt := time.Now().UTC()
+
+	historyResp, err := s.raw.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:  inputPeer,
+		Limit: 1,
+	})
+	if err == nil {
+		if mod, ok := historyResp.AsModified(); ok {
+			for _, cls := range mod.GetMessages() {
+				if m, ok := cls.(*tg.Message); ok && m.Out {
+					msgID = strconv.Itoa(m.ID)
+					createdAt = time.Unix(int64(m.GetDate()), 0).UTC()
+					break
+				}
+			}
+		}
+	}
+
+	row := store.MessageRecord{
+		ChatID:            chatID,
+		TelegramMessageID: msgID,
+		SenderName:        senderName,
+		Direction:         "me",
+		Text:              text,
+		CreatedAt:         createdAt,
+	}
+	if err := s.db.SaveMessage(ctx, row); err != nil {
+		return store.MessageRecord{}, err
+	}
+	return row, nil
 }
 
 func (s *Service) normalizeHistory(messages []tg.MessageClass) []historyEntry {
@@ -509,6 +876,23 @@ func isGroupPeer(peer tg.PeerClass) bool {
 func isChannelPeer(peer tg.PeerClass) bool {
 	_, ok := peer.(*tg.PeerChannel)
 	return ok
+}
+
+func (s *Service) inputPeerFromChatID(ctx context.Context, chatID string) (tg.InputPeerClass, error) {
+	chatID = strings.TrimSpace(chatID)
+	if !strings.HasPrefix(chatID, "user:") {
+		return nil, fmt.Errorf("only private user chats are supported")
+	}
+	rawUserID := strings.TrimSpace(strings.TrimPrefix(chatID, "user:"))
+	userID, err := strconv.ParseInt(rawUserID, 10, 64)
+	if err != nil || userID <= 0 {
+		return nil, fmt.Errorf("invalid chat_id: %s", chatID)
+	}
+	resolved, err := s.peerMgr.ResolveUserID(ctx, userID)
+	if err == nil {
+		return resolved.InputPeer(), nil
+	}
+	return s.resolveInputPeerFromDialogs(ctx, userID)
 }
 
 func (s *Service) resolveInputPeer(ctx context.Context, entities tg.Entities, peerID tg.PeerClass) (tg.InputPeerClass, error) {

@@ -52,7 +52,7 @@ func run() error {
 		cfg.OpenAI.MaxTokens,
 		logger,
 	)
-	telegramService := tgsvc.NewService(cfg, logger, db, aiClient, soulPrompt)
+	telegramService := tgsvc.NewService(cfg, logger, db, aiClient, soulPrompt, nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -33,6 +33,7 @@ type Config struct {
 
 	AutoReply struct {
 		Enabled         bool
+		DebounceSeconds int
 		PrivateOnly     bool
 		IgnoreBots      bool
 		IgnoreGroups    bool
@@ -93,6 +94,7 @@ func LoadForApp() (Config, error) {
 	cfg.OpenAI.MaxTokens = fixedAIMaxTokens
 
 	cfg.AutoReply.Enabled = getBool("AUTO_REPLY_ENABLED", true)
+	cfg.AutoReply.DebounceSeconds = getNonNegativeInt("AUTO_REPLY_DEBOUNCE_SECONDS", 10)
 	cfg.AutoReply.PrivateOnly = fixedPrivateOnly
 	cfg.AutoReply.IgnoreBots = fixedIgnoreBots
 	cfg.AutoReply.IgnoreGroups = fixedIgnoreGroups
@@ -165,6 +167,14 @@ func getInt(name string, fallback int) int {
 func getPositiveInt(name string, fallback int) int {
 	v := getInt(name, fallback)
 	if v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func getNonNegativeInt(name string, fallback int) int {
+	v := getInt(name, fallback)
+	if v < 0 {
 		return fallback
 	}
 	return v
