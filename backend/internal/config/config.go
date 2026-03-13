@@ -14,6 +14,7 @@ type Config struct {
 	LogLevel       string
 	SQLitePath     string
 	SoulPromptPath string
+	AgentsDir      string
 	ContextLimit   int
 
 	Telegram struct {
@@ -62,6 +63,7 @@ func LoadForApp() (Config, error) {
 		LogLevel:       getString("LOG_LEVEL", "info"),
 		SQLitePath:     getString("SQLITE_PATH", "./data/app.db"),
 		SoulPromptPath: getString("SOUL_PROMPT_PATH", "./SOUL.md"),
+		AgentsDir:      getString("AGENTS_DIR", "./agents"),
 		ContextLimit:   getPositiveInt("AI_CONTEXT_MESSAGE_LIMIT", fixedContextLimit),
 	}
 

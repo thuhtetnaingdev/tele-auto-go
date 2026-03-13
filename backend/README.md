@@ -69,6 +69,14 @@ Default API address: `http://localhost:3000`
 - `POST /api/service/restart`
 - `GET /api/settings`
 - `PUT /api/settings`
+- `GET /api/variables`
+- `PUT /api/variables`
+- `DELETE /api/variables/:key`
+- `GET /api/agents`
+- `POST /api/agents`
+- `GET /api/agents/:id`
+- `PUT /api/agents/:id`
+- `DELETE /api/agents/:id`
 - `GET /api/soul`
 - `PUT /api/soul`
 - `GET /api/logs`
@@ -110,6 +118,7 @@ make build-control
 - `CONTROL_PORT` (optional): control API port override
 - `FRONTEND_ORIGIN` (optional): CORS origin (default `http://localhost:5173`)
 - `WEB_DIR` (optional): static frontend dir to serve (default `./web`)
+- `AGENTS_DIR` (optional): markdown agents dir (default `./agents`)
 - `AI_CONTEXT_MESSAGE_LIMIT` (optional): conversation context message count (default `20`)
 - `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `ADMIN_PASSWORD_SALT`, `ADMIN_SESSION_SECRET` (required)
 - `ADMIN_SESSION_TTL_HOURS` (default `168`)

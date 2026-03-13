@@ -13,9 +13,11 @@ import (
 
 	"go.uber.org/zap"
 
+	"tele-auto-go/internal/agents"
 	"tele-auto-go/internal/ai"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/contextbuilder"
+	"tele-auto-go/internal/orchestrator"
 	"tele-auto-go/internal/store"
 	"tele-auto-go/internal/util"
 
@@ -34,6 +36,7 @@ type Service struct {
 	db         *store.Store
 	ai         *ai.Client
 	soulPrompt string
+	orch       *orchestrator.Engine
 
 	dispatcher tg.UpdateDispatcher
 	client     *telegram.Client
@@ -55,12 +58,21 @@ type historyEntry struct {
 }
 
 func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClient *ai.Client, soulPrompt string) *Service {
+	var orch *orchestrator.Engine
+	agentMgr, err := agents.NewManager(cfg.AgentsDir, logger)
+	if err != nil {
+		logger.Warn("failed to initialize agent manager; fallback reply mode enabled", "error", err.Error())
+	} else {
+		orch = orchestrator.New(aiClient, agentMgr, db, logger)
+	}
+
 	return &Service{
 		cfg:        cfg,
 		logger:     logger,
 		db:         db,
 		ai:         aiClient,
 		soulPrompt: soulPrompt,
+		orch:       orch,
 	}
 }
 
@@ -264,16 +276,42 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		return nil
 	}
 
-	systemPrompt, userPrompt := contextbuilder.Build(
-		s.chatNameFromPeer(ctx, entities, peerID),
-		toContextLines(history),
-		latestIncomingText,
-		s.soulPrompt,
-	)
-	reply, err := s.ai.GenerateReply(ctx, systemPrompt, userPrompt)
-	if err != nil {
-		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "ai_error", err.Error())
-		return fmt.Errorf("ai generate: %w", err)
+	reply := ""
+	replySource := "none"
+	if s.orch != nil {
+		reply, err = s.orch.Handle(ctx, orchestrator.MessageContext{
+			ChatID:         chatID,
+			ChatName:       s.chatNameFromPeer(ctx, entities, peerID),
+			LatestIncoming: latestIncomingText,
+			RecentMessages: toContextLines(history),
+			TriggerMessage: triggerID,
+		}, s.soulPrompt)
+		if err != nil {
+			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
+		} else if strings.TrimSpace(reply) != "" {
+			replySource = "orchestrator"
+		}
+	} else {
+		s.logger.Warn("orchestrator unavailable; fallback to legacy reply", "chat_id", chatID, "message_id", triggerID)
+	}
+	if strings.TrimSpace(reply) == "" {
+		s.logger.Info("using legacy ai fallback",
+			"chat_id", chatID,
+			"message_id", triggerID,
+			"reason", "orchestrator_empty_or_unavailable",
+		)
+		systemPrompt, userPrompt := contextbuilder.Build(
+			s.chatNameFromPeer(ctx, entities, peerID),
+			toContextLines(history),
+			latestIncomingText,
+			s.soulPrompt,
+		)
+		reply, err = s.ai.GenerateReply(ctx, systemPrompt, userPrompt)
+		if err != nil {
+			_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "ai_error", err.Error())
+			return fmt.Errorf("ai generate: %w", err)
+		}
+		replySource = "legacy_ai"
 	}
 	if strings.TrimSpace(reply) == "" {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_empty", "AI returned blank text")
@@ -296,8 +334,23 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		s.logger.Warn("failed to mark auto reply sent", "error", err.Error())
 	}
 
-	s.logger.Info("Auto-reply sent", "chat_id", chatID, "message_id", triggerID, "context_count", len(history))
+	s.logger.Info(
+		"Auto-reply sent",
+		"chat_id", chatID,
+		"message_id", triggerID,
+		"context_count", len(history),
+		"source", replySource,
+		"reply_preview", truncatePreview(reply, 220),
+	)
 	return nil
+}
+
+func truncatePreview(text string, max int) string {
+	v := util.NormalizeSpace(text)
+	if max <= 0 || len(v) <= max {
+		return v
+	}
+	return v[:max] + "...(truncated)"
 }
 
 func (s *Service) normalizeHistory(messages []tg.MessageClass) []historyEntry {

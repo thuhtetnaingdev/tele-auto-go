@@ -64,8 +64,20 @@ type chatCompletionResponse struct {
 	Usage map[string]any `json:"usage"`
 }
 
+type ChatParams struct {
+	SystemPrompt string
+	UserPrompt   string
+	Model        string
+	Temperature  float64
+	MaxTokens    int
+}
+
 func (c *Client) GenerateReply(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	reply, finishReason, usage, err := c.generateOnce(ctx, systemPrompt, userPrompt, 0.45)
+	reply, finishReason, usage, err := c.generateOnce(ctx, ChatParams{
+		SystemPrompt: systemPrompt,
+		UserPrompt:   userPrompt,
+		Temperature:  0.45,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -73,7 +85,11 @@ func (c *Client) GenerateReply(ctx context.Context, systemPrompt, userPrompt str
 	if reply == "" {
 		c.logger.Warn("AI returned blank output, retrying once", "model", c.model, "finish_reason", finishReason, "usage", usage)
 		retrySystem := systemPrompt + "\n\nCritical output rule: output only one final short reply sentence. No analysis."
-		reply, _, _, err = c.generateOnce(ctx, retrySystem, userPrompt, 0.25)
+		reply, _, _, err = c.generateOnce(ctx, ChatParams{
+			SystemPrompt: retrySystem,
+			UserPrompt:   userPrompt,
+			Temperature:  0.25,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -87,21 +103,40 @@ func (c *Client) GenerateReply(ctx context.Context, systemPrompt, userPrompt str
 	return reply, nil
 }
 
+func (c *Client) Chat(ctx context.Context, params ChatParams) (string, error) {
+	reply, _, _, err := c.generateOnce(ctx, params)
+	if err != nil {
+		return "", err
+	}
+	return util.NormalizeSpace(util.StripThinking(reply)), nil
+}
+
 func (c *Client) generateOnce(
 	ctx context.Context,
-	systemPrompt string,
-	userPrompt string,
-	temperature float64,
+	params ChatParams,
 ) (reply string, finishReason string, usage map[string]any, err error) {
+	model := strings.TrimSpace(params.Model)
+	if model == "" {
+		model = c.model
+	}
+	temperature := params.Temperature
+	if temperature == 0 {
+		temperature = 0.4
+	}
+	maxTokens := params.MaxTokens
+	if maxTokens < 64 {
+		maxTokens = c.maxTokens
+	}
+
 	payload := chatCompletionRequest{
-		Model: c.model,
+		Model: model,
 		Messages: []chatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
+			{Role: "system", Content: params.SystemPrompt},
+			{Role: "user", Content: params.UserPrompt},
 		},
 		Temperature: temperature,
 		N:           1,
-		MaxTokens:   c.maxTokens,
+		MaxTokens:   maxTokens,
 	}
 
 	body, err := json.Marshal(payload)

@@ -1,19 +1,25 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Bot,
   Clock3,
+  Database,
   KeyRound,
+  LayoutDashboard,
   Lock,
   LogOut,
+  Menu,
   Play,
   RefreshCw,
   Save,
+  Settings2,
   ShieldCheck,
+  SlidersHorizontal,
   Square,
   Terminal,
   UserCircle2,
   WandSparkles,
+  X,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +29,16 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 
 type ServiceStatus = {
   running: boolean
@@ -73,6 +89,41 @@ type AdminSession = {
   authenticated: boolean
   username?: string
 }
+
+type AgentDefinition = {
+  id: string
+  name: string
+  description: string
+  intents: string[]
+  tools: string[]
+  variables: string[]
+  model?: string
+  temperature?: number
+  body: string
+  markdown?: string
+  updatedAt?: string
+}
+
+type VariableValue = {
+  key: string
+  type: 'text' | 'secret'
+  value: string
+  masked?: boolean
+  updatedAt?: string
+}
+
+type ConfirmDialogState = {
+  open: boolean
+  title: string
+  description: string
+  confirmLabel: string
+  confirmVariant: 'default' | 'destructive'
+  runner: (() => Promise<void>) | null
+  successText: string
+}
+
+type MainPage = 'dashboard' | 'logs' | 'agents' | 'settings'
+type SettingsPage = 'soul' | 'telegram' | 'setting' | 'variables' | 'user'
 
 const API_BASE_RAW = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
 const API_BASE = API_BASE_RAW ? API_BASE_RAW.replace(/\/+$/, '') : ''
@@ -183,6 +234,37 @@ export default function App() {
   const [password, setPassword] = useState('')
 
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [logMode, setLogMode] = useState<'all' | 'orchestrator'>('all')
+
+  const [agents, setAgents] = useState<AgentDefinition[]>([])
+  const [editingAgentID, setEditingAgentID] = useState('')
+  const [agentForm, setAgentForm] = useState<AgentDefinition>({
+    id: '',
+    name: '',
+    description: '',
+    intents: [],
+    tools: ['api_call'],
+    variables: [],
+    model: '',
+    temperature: 0.35,
+    body: '',
+  })
+
+  const [variables, setVariables] = useState<VariableValue[]>([])
+  const [variableForm, setVariableForm] = useState<VariableValue>({ key: '', type: 'text', value: '' })
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState>({
+    open: false,
+    title: 'Please Confirm',
+    description: '',
+    confirmLabel: 'Confirm',
+    confirmVariant: 'default',
+    runner: null,
+    successText: '',
+  })
+  const confirmResolverRef = useRef<((ok: boolean) => void) | null>(null)
+  const [activePage, setActivePage] = useState<MainPage>('dashboard')
+  const [activeSettingsPage, setActiveSettingsPage] = useState<SettingsPage>('setting')
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
   const settingsValues = settings && settings.values && typeof settings.values === 'object' ? settings.values : {}
   const settingsKeys = settings && Array.isArray(settings.keys) ? settings.keys : []
@@ -196,6 +278,11 @@ export default function App() {
   const needsAppLogin = !adminSession.authenticated
   const showOnboarding = !loading && !needsAppLogin && needsConfig
   const canManageWorker = authStatus.authorized
+  const telegramConnection = authStatus.authorized
+    ? { label: 'Connected', dotClass: 'bg-emerald-500', badgeVariant: 'default' as const }
+    : authStatus.configured
+      ? { label: 'Pending Verify', dotClass: 'bg-amber-400', badgeVariant: 'secondary' as const }
+      : { label: 'Disconnected', dotClass: 'bg-red-500', badgeVariant: 'destructive' as const }
   const telegramPhoneLabel = normalizePhoneWithPlus(phone) || 'Not set'
   const soulCharacterCount = soulText.length
 
@@ -221,12 +308,14 @@ export default function App() {
         return
       }
 
-      const [auth, service, settingsData, soul, logPayload] = await Promise.all([
+      const [auth, service, settingsData, soul, logPayload, agentsPayload, varsPayload] = await Promise.all([
         apiRequest<AuthStatus>('/api/auth/status'),
         apiRequest<ServiceStatus>('/api/service/status'),
         apiRequest<SettingsResponse>('/api/settings'),
         apiRequest<{ content: string }>('/api/soul'),
         apiRequest<{ logs: LogEntry[] }>('/api/logs?limit=200'),
+        apiRequest<{ agents: AgentDefinition[] }>('/api/agents'),
+        apiRequest<{ values: VariableValue[] }>('/api/variables'),
       ])
       setAuthStatus(auth)
       setServiceStatus(service)
@@ -235,6 +324,8 @@ export default function App() {
       setSoulText(soul.content || '')
       setSoulLoadedAt(new Date().toISOString())
       setLogs(logPayload.logs || [])
+      setAgents(agentsPayload.agents || [])
+      setVariables(varsPayload.values || [])
     } catch (err) {
       handleRequestError(err)
     } finally {
@@ -280,25 +371,96 @@ export default function App() {
     }
   }, [phone])
 
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return
+    }
+    if (mobileNavOpen) {
+      document.body.style.overflow = 'hidden'
+      return () => {
+        document.body.style.overflow = ''
+      }
+    }
+    document.body.style.overflow = ''
+  }, [mobileNavOpen])
+
+  useEffect(() => {
+    setMobileNavOpen(false)
+  }, [activePage, activeSettingsPage])
+
+  const currentPageLabel = activePage === 'settings'
+    ? `Settings / ${activeSettingsPage === 'soul'
+      ? 'Soul'
+      : activeSettingsPage === 'telegram'
+        ? 'Telegram'
+        : activeSettingsPage === 'setting'
+          ? 'Setting'
+          : activeSettingsPage === 'variables'
+            ? 'Global Variables'
+            : 'User'}`
+    : activePage === 'agents'
+      ? 'Agents'
+      : activePage === 'logs'
+        ? 'Logs'
+        : 'Dashboard'
+
   const runAction = async (runner: () => Promise<void>, successText: string) => {
     setBusy(true)
     setMessage('')
+    let ok = false
     try {
       await runner()
       setMessage(successText)
       await refreshState()
+      ok = true
     } catch (err) {
       handleRequestError(err)
     } finally {
       setBusy(false)
     }
+    return ok
   }
 
-  const runConfirmedAction = async (confirmText: string, runner: () => Promise<void>, successText: string) => {
-    if (!window.confirm(confirmText)) {
+  const runConfirmedAction = async (
+    confirmText: string,
+    runner: () => Promise<void>,
+    successText: string,
+    options?: {
+      title?: string
+      confirmLabel?: string
+      confirmVariant?: 'default' | 'destructive'
+    },
+  ) => {
+    return await new Promise<boolean>((resolve) => {
+      confirmResolverRef.current = resolve
+      setConfirmDialog({
+        open: true,
+        title: options?.title || 'Please Confirm',
+        description: confirmText,
+        confirmLabel: options?.confirmLabel || 'Confirm',
+        confirmVariant: options?.confirmVariant || 'default',
+        runner,
+        successText,
+      })
+    })
+  }
+
+  const closeConfirmDialog = (ok: boolean) => {
+    setConfirmDialog((prev) => ({ ...prev, open: false }))
+    const resolver = confirmResolverRef.current
+    confirmResolverRef.current = null
+    if (resolver) {
+      resolver(ok)
+    }
+  }
+
+  const handleConfirmAction = async () => {
+    if (!confirmDialog.runner) {
+      closeConfirmDialog(false)
       return
     }
-    await runAction(runner, successText)
+    const ok = await runAction(confirmDialog.runner, confirmDialog.successText)
+    closeConfirmDialog(ok)
   }
 
   const saveSettingsSubset = async (keys: string[], successText: string) => {
@@ -398,6 +560,122 @@ export default function App() {
     }))
   }
 
+  const resetAgentForm = () => {
+    setEditingAgentID('')
+    setAgentForm({
+      id: '',
+      name: '',
+      description: '',
+      intents: [],
+      tools: ['api_call'],
+      variables: [],
+      model: '',
+      temperature: 0.35,
+      body: '',
+    })
+  }
+
+  const startEditAgent = (agent: AgentDefinition) => {
+    setEditingAgentID(agent.id)
+    setAgentForm({
+      ...agent,
+      intents: agent.intents || [],
+      tools: ['api_call'],
+      variables: agent.variables || [],
+      body: agent.body || '',
+      temperature: agent.temperature || 0.35,
+    })
+  }
+
+  const saveAgent = async () => {
+    if (!agentForm.id.trim() || !agentForm.name.trim() || !agentForm.body.trim()) {
+      setMessage('Agent id, name, and body are required.')
+      return
+    }
+    const normalizedIntents = agentForm.intents.map((v) => v.trim()).filter(Boolean)
+    const normalizedVariables = agentForm.variables.map((v) => v.trim().toUpperCase()).filter(Boolean)
+    const payload = {
+      id: agentForm.id.trim(),
+      name: agentForm.name.trim(),
+      description: agentForm.description.trim(),
+      intents: normalizedIntents,
+      tools: ['api_call'],
+      variables: normalizedVariables,
+      model: (agentForm.model || '').trim(),
+      body: agentForm.body.trim(),
+      temperature: Number(agentForm.temperature || 0.35),
+    }
+    const isEdit = editingAgentID === payload.id
+    const path = isEdit ? `/api/agents/${payload.id}` : '/api/agents'
+    const method = isEdit ? 'PUT' : 'POST'
+    const ok = await runAction(
+      () => apiRequest(path, { method, body: JSON.stringify(payload) }).then(() => undefined),
+      isEdit ? 'Agent updated' : 'Agent created',
+    )
+    if (ok) {
+      resetAgentForm()
+    }
+  }
+
+  const deleteAgent = async (id: string) => {
+    await runConfirmedAction(
+      `Delete agent "${id}"?`,
+      () => apiRequest(`/api/agents/${id}`, { method: 'DELETE' }).then(() => undefined),
+      'Agent deleted',
+      { title: 'Delete Agent', confirmLabel: 'Delete', confirmVariant: 'destructive' },
+    )
+    if (editingAgentID === id) {
+      resetAgentForm()
+    }
+  }
+
+  const saveVariable = async () => {
+    const key = variableForm.key.trim().toUpperCase()
+    if (!key) {
+      setMessage('Variable key is required.')
+      return
+    }
+    if (!/^[A-Z0-9_]{2,64}$/.test(key)) {
+      setMessage('Variable key must match A-Z, 0-9, _ and be 2-64 chars.')
+      return
+    }
+    if (!variableForm.value.trim()) {
+      setMessage('Variable value is required.')
+      return
+    }
+    await runAction(
+      () =>
+        apiRequest('/api/variables', {
+          method: 'PUT',
+          body: JSON.stringify({
+            values: [{ key, type: variableForm.type, value: variableForm.value }],
+          }),
+        }).then(() => undefined),
+      'Variable saved',
+    )
+    setVariableForm({ key: '', type: 'text', value: '' })
+  }
+
+  const deleteVariable = async (key: string) => {
+    await runConfirmedAction(
+      `Delete variable "${key}"?`,
+      () => apiRequest(`/api/variables/${encodeURIComponent(key)}`, { method: 'DELETE' }).then(() => undefined),
+      'Variable deleted',
+      { title: 'Delete Variable', confirmLabel: 'Delete', confirmVariant: 'destructive' },
+    )
+    if (variableForm.key.trim().toUpperCase() === key) {
+      setVariableForm({ key: '', type: 'text', value: '' })
+    }
+  }
+
+  const filteredLogs = useMemo(() => {
+    if (logMode === 'all') return logs
+    return logs.filter((entry) => {
+      const blob = `${entry.message} ${JSON.stringify(entry.attrs || {})}`.toLowerCase()
+      return blob.includes('orchestrator') || blob.includes('agent_tool_call')
+    })
+  }, [logs, logMode])
+
   const loginAdmin = async () => {
     if (!adminUsername.trim() || !adminPassword) {
       setMessage('Username and password are required.')
@@ -494,6 +772,76 @@ export default function App() {
     )
   }
 
+  const openPage = (page: MainPage) => {
+    setActivePage(page)
+    setMobileNavOpen(false)
+  }
+
+  const openSettingsPage = (page: SettingsPage) => {
+    setActivePage('settings')
+    setActiveSettingsPage(page)
+    setMobileNavOpen(false)
+  }
+
+  const renderNavigation = () => (
+    <>
+      <p className="px-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Navigation</p>
+      <div className="space-y-2">
+        <Button
+          size="sm"
+          variant={activePage === 'dashboard' ? 'default' : 'outline'}
+          className="w-full justify-start"
+          onClick={() => openPage('dashboard')}
+        >
+          <LayoutDashboard className="size-4" /> Dashboard
+        </Button>
+        <Button
+          size="sm"
+          variant={activePage === 'logs' ? 'default' : 'outline'}
+          className="w-full justify-start"
+          onClick={() => openPage('logs')}
+        >
+          <Terminal className="size-4" /> Logs
+        </Button>
+        <Button
+          size="sm"
+          variant={activePage === 'agents' ? 'default' : 'outline'}
+          className="w-full justify-start"
+          onClick={() => openPage('agents')}
+        >
+          <Bot className="size-4" /> Agents
+        </Button>
+        <Button
+          size="sm"
+          variant={activePage === 'settings' ? 'default' : 'outline'}
+          className="w-full justify-start"
+          onClick={() => openPage('settings')}
+        >
+          <Settings2 className="size-4" /> Setting
+        </Button>
+        {activePage === 'settings' ? (
+          <div className="ml-3 space-y-1 border-l border-border/60 pl-3">
+            <Button size="sm" variant={activeSettingsPage === 'soul' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => openSettingsPage('soul')}>
+              <WandSparkles className="size-4" /> Soul
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'telegram' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => openSettingsPage('telegram')}>
+              <Bot className="size-4" /> Telegram
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'setting' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => openSettingsPage('setting')}>
+              <SlidersHorizontal className="size-4" /> Setting
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'variables' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => openSettingsPage('variables')}>
+              <Database className="size-4" /> Global Variables
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'user' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => openSettingsPage('user')}>
+              <UserCircle2 className="size-4" /> User
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </>
+  )
+
   if (loading) {
     return (
       <main className="min-h-screen bg-background px-4 py-10 text-foreground">
@@ -550,7 +898,7 @@ export default function App() {
   }
 
   return (
-    <main className="min-h-screen bg-background px-4 py-8 text-foreground">
+    <main className="min-h-screen bg-background px-3 py-6 text-foreground sm:px-4 sm:py-8">
       <div className="mx-auto w-full max-w-7xl space-y-6">
         {showOnboarding ? (
           <section className="space-y-5">
@@ -594,111 +942,39 @@ export default function App() {
           </section>
         ) : (
           <>
-            <header className="relative overflow-hidden rounded-2xl border border-border/60 bg-gradient-to-r from-amber-100 via-orange-50 to-teal-100 p-6 shadow-sm dark:from-amber-950/30 dark:via-background dark:to-teal-900/20">
-              <div className="space-y-2">
-                <h1 className="font-display text-3xl tracking-tight">Tele Auto Control Center</h1>
-                <p className="max-w-3xl text-sm text-muted-foreground">AI system console for worker state, Telegram auth, settings, and runtime logs.</p>
-              </div>
-              <div className="mt-4 flex flex-wrap items-center gap-2">
-                <Badge variant={authStatus.authorized ? 'default' : 'destructive'}>
-                  <ShieldCheck className="mr-1 size-3" />
-                  {authStatus.authorized ? 'Telegram Authorized' : 'Not Authorized'}
-                </Badge>
-                <Badge variant={serviceStatus.running ? 'default' : 'outline'}>
-                  <Activity className="mr-1 size-3" />
-                  {serviceStatus.running ? `Worker Running (${formatUptime(serviceStatus.uptimeSec)})` : 'Worker Stopped'}
-                </Badge>
-                {adminSession.username ? <Badge variant="secondary">Signed in as {adminSession.username}</Badge> : null}
-                {serviceStatus.lastError ? <Badge variant="destructive">Last Error: {serviceStatus.lastError}</Badge> : null}
-              </div>
-              <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                <div className="rounded-lg border border-border/70 bg-background/70 p-3">
-                  <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-                    <Activity className="size-3" /> Worker
-                  </p>
-                  <p className="mt-1 text-sm font-semibold">{serviceStatus.running ? 'Running' : 'Stopped'}</p>
-                </div>
-                <div className="rounded-lg border border-border/70 bg-background/70 p-3">
-                  <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-                    <Bot className="size-3" /> Telegram
-                  </p>
-                  <p className="mt-1 text-sm font-semibold">{authStatus.authorized ? 'Connected' : 'Needs Verify'}</p>
-                </div>
-                <div className="rounded-lg border border-border/70 bg-background/70 p-3">
-                  <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-                    <Clock3 className="size-3" /> Uptime
-                  </p>
-                  <p className="mt-1 text-sm font-semibold">{serviceStatus.running ? formatUptime(serviceStatus.uptimeSec) : '0s'}</p>
-                </div>
-                {authStatus.authorized ? (
-                  <div className="rounded-lg border border-border/70 bg-background/70 p-3">
-                    <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-                      <UserCircle2 className="size-3" /> Telegram Phone
-                    </p>
-                    <p className="mt-1 text-sm font-semibold">{telegramPhoneLabel}</p>
-                  </div>
-                ) : null}
-              </div>
-              <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-background/60 p-2">
-                  <Button size="sm" variant="outline" onClick={() => void refreshState()} disabled={busy || loading}>
-                    <RefreshCw className="size-4" /> Refresh
-                  </Button>
-                  {canManageWorker ? (
-                    <>
-                      <Button
-                        size="sm"
-                        variant="success"
-                        onClick={() => void runAction(() => apiRequest('/api/service/start', { method: 'POST' }), 'Worker started')}
-                        disabled={busy || serviceStatus.running}
-                      >
-                        <Play className="size-4" /> Start
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="info"
-                        onClick={() =>
-                          void runConfirmedAction(
-                            'Restart worker now?',
-                            () => apiRequest('/api/service/restart', { method: 'POST' }).then(() => undefined),
-                            'Worker restarted',
-                          )
-                        }
-                        disabled={busy || !serviceStatus.running}
-                      >
-                        <RefreshCw className="size-4" /> Restart
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        onClick={() =>
-                          void runConfirmedAction(
-                            'Stop worker now?',
-                            () => apiRequest('/api/service/stop', { method: 'POST' }).then(() => undefined),
-                            'Worker stopped',
-                          )
-                        }
-                        disabled={busy || !serviceStatus.running}
-                      >
-                        <Square className="size-4" /> Stop
-                      </Button>
-                    </>
-                  ) : (
-                    <Badge variant="secondary">Verify Telegram to unlock worker controls</Badge>
-                  )}
-                </div>
-                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-background/60 p-2">
-                  {authStatus.authorized ? (
-                    <Button size="sm" variant="outline" onClick={() => void logoutTelegram()} disabled={busy}>
-                      <LogOut className="size-4" /> Telegram Sign Out
+            <header className="sticky top-3 z-30 rounded-2xl border border-border/60 bg-card/90 px-4 py-3 shadow-sm backdrop-blur">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div className="flex items-center gap-2">
+                  {!needsAuth ? (
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="xl:hidden"
+                      onClick={() => setMobileNavOpen(true)}
+                      aria-label="Open navigation menu"
+                    >
+                      <Menu className="size-4" />
                     </Button>
                   ) : null}
-                  <Button size="sm" variant="outline" onClick={() => void logoutAdmin()} disabled={busy}>
-                    <UserCircle2 className="size-4" /> Dashboard Sign Out
-                  </Button>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <h1 className="font-brand text-xl leading-tight sm:text-2xl">Tele Auto</h1>
+                    <span className="rounded-full border border-border/70 bg-muted/70 px-3 py-1 text-[11px] font-medium text-muted-foreground sm:text-xs">
+                      Agentic Telegram Automation
+                    </span>
+                  </div>
+                </div>
+                <div className="flex w-full flex-wrap gap-2 lg:w-auto lg:justify-end">
+                  <Badge variant={telegramConnection.badgeVariant}>
+                    <ShieldCheck className="mr-1 size-3" />
+                    {telegramConnection.label}
+                  </Badge>
+                  <Badge variant={serviceStatus.running ? 'default' : 'outline'}>
+                    <Activity className="mr-1 size-3" />
+                    {serviceStatus.running ? `Worker Running (${formatUptime(serviceStatus.uptimeSec)})` : 'Worker Stopped'}
+                  </Badge>
+                  {adminSession.username ? <Badge variant="secondary">Signed in as {adminSession.username}</Badge> : null}
                 </div>
               </div>
-              {message ? <p className="mt-3 text-sm text-primary">{message}</p> : null}
             </header>
 
             {needsAuth ? (
@@ -778,147 +1054,530 @@ export default function App() {
                 </Card>
               </>
             ) : (
-              <>
-                <section className="grid gap-6 lg:grid-cols-2">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>Settings</CardTitle>
-                      <CardDescription>Only daily-use settings are shown. Advanced values are hidden and fixed.</CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-3">
-                      {MAIN_VISIBLE_SETTINGS.filter((key) => settingsKeys.includes(key)).map((key) => {
-                        const value = settingsValues[key] ?? ''
-                        if (booleanSettingKeys.has(key)) {
-                          return (
-                            <div key={key} className="flex items-center justify-between rounded-lg border border-border/60 bg-background p-2.5">
-                              <div>
-                                <Label>{settingLabels[key] || key}</Label>
-                                <p className="text-xs text-muted-foreground">Feature toggle</p>
+              <div className="relative">
+                <div
+                  className={`fixed inset-0 z-40 bg-slate-900/45 transition-opacity duration-200 xl:hidden ${mobileNavOpen ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
+                  onClick={() => setMobileNavOpen(false)}
+                />
+                <aside
+                  className={`fixed inset-y-0 left-0 z-50 w-[88%] max-w-[320px] transform border-r border-border/60 bg-background p-4 shadow-2xl transition-transform duration-200 xl:hidden ${mobileNavOpen ? 'translate-x-0' : '-translate-x-full'}`}
+                  aria-hidden={!mobileNavOpen}
+                >
+                  <div className="flex items-center justify-between pb-4">
+                    <p className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Menu</p>
+                    <Button variant="ghost" size="icon" onClick={() => setMobileNavOpen(false)} aria-label="Close navigation menu">
+                      <X className="size-4" />
+                    </Button>
+                  </div>
+                  <div className="space-y-4">{renderNavigation()}</div>
+                </aside>
+
+                <div className="grid items-start gap-6 xl:grid-cols-[250px_minmax(0,1fr)]">
+                  <aside className="hidden self-start space-y-4 rounded-2xl border border-border/60 bg-card/70 p-3 xl:sticky xl:top-24 xl:block">
+                    {renderNavigation()}
+                  </aside>
+
+                  <div className="space-y-6">
+                    <div className="rounded-xl border border-border/60 bg-card/75 px-4 py-3">
+                      <p className="text-xs uppercase tracking-wide text-muted-foreground">Current Page</p>
+                      <p className="mt-1 text-lg font-semibold">{currentPageLabel}</p>
+                    </div>
+                    {message ? (
+                      <div className="rounded-xl border border-primary/30 bg-primary/10 px-4 py-2 text-sm text-primary">
+                        {message}
+                      </div>
+                    ) : null}
+
+                  {activePage === 'dashboard' ? (
+                    <section className="space-y-4">
+                      <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-gradient-to-r from-amber-100 via-orange-50 to-teal-100 p-4 shadow-sm dark:from-amber-950/30 dark:via-background dark:to-teal-900/20 sm:p-6">
+                        <div className="space-y-2">
+                          <h2 className="font-display text-2xl tracking-tight sm:text-3xl">Tele Auto Control Center</h2>
+                          <p className="max-w-3xl text-sm text-muted-foreground">AI system console for worker state, Telegram auth, settings, and runtime logs.</p>
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-start gap-2 sm:items-center">
+                          <Badge variant={telegramConnection.badgeVariant}>
+                            <ShieldCheck className="mr-1 size-3" />
+                            <span className={`mr-2 inline-block size-2 rounded-full align-middle ${telegramConnection.dotClass}`} />
+                            {telegramConnection.label}
+                          </Badge>
+                          <Badge variant={serviceStatus.running ? 'default' : 'outline'}>
+                            <Activity className="mr-1 size-3" />
+                            {serviceStatus.running ? `Worker Running (${formatUptime(serviceStatus.uptimeSec)})` : 'Worker Stopped'}
+                          </Badge>
+                          {adminSession.username ? <Badge variant="secondary">Signed in as {adminSession.username}</Badge> : null}
+                          {serviceStatus.lastError ? <Badge variant="destructive" className="max-w-full break-all">Last Error: {serviceStatus.lastError}</Badge> : null}
+                        </div>
+                        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                          <div className="rounded-lg border border-border/70 bg-background/70 p-3">
+                            <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+                              <Activity className="size-3" /> Worker
+                            </p>
+                            <p className="mt-1 text-sm font-semibold">{serviceStatus.running ? 'Running' : 'Stopped'}</p>
+                          </div>
+                          <div className="rounded-lg border border-border/70 bg-background/70 p-3">
+                            <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+                              <Bot className="size-3" /> Telegram
+                            </p>
+                            <p className="mt-1 flex items-center gap-2 text-sm font-semibold">
+                              <span className={`inline-block size-2.5 rounded-full ${telegramConnection.dotClass}`} />
+                              {telegramConnection.label}
+                            </p>
+                          </div>
+                          <div className="rounded-lg border border-border/70 bg-background/70 p-3">
+                            <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+                              <Clock3 className="size-3" /> Uptime
+                            </p>
+                            <p className="mt-1 text-sm font-semibold">{serviceStatus.running ? formatUptime(serviceStatus.uptimeSec) : '0s'}</p>
+                          </div>
+                          {authStatus.authorized ? (
+                            <div className="rounded-lg border border-border/70 bg-background/70 p-3">
+                              <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+                                <UserCircle2 className="size-3" /> Telegram Phone
+                              </p>
+                              <p className="mt-1 text-sm font-semibold">{telegramPhoneLabel}</p>
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                          <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/60 p-2 sm:flex-row sm:flex-wrap sm:items-center">
+                            <Button size="sm" variant="outline" className="w-full sm:w-auto" onClick={() => void refreshState()} disabled={busy || loading}>
+                              <RefreshCw className="size-4" /> Refresh
+                            </Button>
+                            {canManageWorker ? (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="success"
+                                  className="w-full sm:w-auto"
+                                  onClick={() => void runAction(() => apiRequest('/api/service/start', { method: 'POST' }), 'Worker started')}
+                                  disabled={busy || serviceStatus.running}
+                                >
+                                  <Play className="size-4" /> Start
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="info"
+                                  className="w-full sm:w-auto"
+                                  onClick={() =>
+                                    void runConfirmedAction(
+                                      'Restart worker now?',
+                                      () => apiRequest('/api/service/restart', { method: 'POST' }).then(() => undefined),
+                                      'Worker restarted',
+                                      { title: 'Restart Worker', confirmLabel: 'Restart' },
+                                    )
+                                  }
+                                  disabled={busy || !serviceStatus.running}
+                                >
+                                  <RefreshCw className="size-4" /> Restart
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  className="w-full sm:w-auto"
+                                  onClick={() =>
+                                    void runConfirmedAction(
+                                      'Stop worker now?',
+                                      () => apiRequest('/api/service/stop', { method: 'POST' }).then(() => undefined),
+                                      'Worker stopped',
+                                      { title: 'Stop Worker', confirmLabel: 'Stop', confirmVariant: 'destructive' },
+                                    )
+                                  }
+                                  disabled={busy || !serviceStatus.running}
+                                >
+                                  <Square className="size-4" /> Stop
+                                </Button>
+                              </>
+                            ) : (
+                              <Badge variant="secondary">Verify Telegram to unlock worker controls</Badge>
+                            )}
+                          </div>
+                          <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/60 p-2 sm:flex-row sm:flex-wrap sm:items-center">
+                            {authStatus.authorized ? (
+                              <Button size="sm" variant="outline" className="w-full sm:w-auto" onClick={() => void logoutTelegram()} disabled={busy}>
+                                <LogOut className="size-4" /> Telegram Sign Out
+                              </Button>
+                            ) : null}
+                            <Button size="sm" variant="outline" className="w-full sm:w-auto" onClick={() => void logoutAdmin()} disabled={busy}>
+                              <UserCircle2 className="size-4" /> Dashboard Sign Out
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {activePage === 'logs' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center gap-2">
+                          <Terminal className="size-4" /> Realtime Logs
+                        </CardTitle>
+                        <CardDescription>Streaming from backend SSE endpoint `/api/logs/stream`.</CardDescription>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <Button size="sm" className="w-full sm:w-auto" variant={logMode === 'all' ? 'default' : 'outline'} onClick={() => setLogMode('all')}>
+                            All
+                          </Button>
+                          <Button size="sm" className="w-full sm:w-auto" variant={logMode === 'orchestrator' ? 'default' : 'outline'} onClick={() => setLogMode('orchestrator')}>
+                            Execution Logs
+                          </Button>
+                        </div>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="max-h-[380px] overflow-auto rounded-lg border border-border/60 bg-zinc-950 p-3 font-mono text-xs text-zinc-100">
+                          {filteredLogs.map((entry, index) => (
+                            <div key={`${entry.time}-${index}`} className="mb-1 break-all">
+                              <span className="text-zinc-400">[{entry.time}]</span>{' '}
+                              <span className={entry.level.includes('error') ? 'text-rose-300' : entry.level.includes('warn') ? 'text-amber-300' : 'text-emerald-300'}>
+                                {entry.level.toUpperCase()}
+                              </span>{' '}
+                              <span>{entry.message}</span>
+                              {entry.attrs && Object.keys(entry.attrs).length > 0 ? (
+                                <>
+                                  {' '}
+                                  <span className="text-zinc-300">{JSON.stringify(entry.attrs)}</span>
+                                </>
+                              ) : null}
+                            </div>
+                          ))}
+                          {filteredLogs.length === 0 ? <p className="text-zinc-400">No logs yet.</p> : null}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+
+                  {activePage === 'agents' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Agents</CardTitle>
+                        <CardDescription>Create Markdown-based agents with frontmatter metadata.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <Input
+                            placeholder="id (e.g. price_agent)"
+                            value={agentForm.id}
+                            disabled={Boolean(editingAgentID)}
+                            onChange={(event) => setAgentForm((prev) => ({ ...prev, id: event.target.value }))}
+                            className="h-9"
+                          />
+                          <Input
+                            placeholder="name"
+                            value={agentForm.name}
+                            onChange={(event) => setAgentForm((prev) => ({ ...prev, name: event.target.value }))}
+                            className="h-9"
+                          />
+                          <Input
+                            placeholder="description"
+                            value={agentForm.description}
+                            onChange={(event) => setAgentForm((prev) => ({ ...prev, description: event.target.value }))}
+                            className="h-9 sm:col-span-2"
+                          />
+                          <Input
+                            placeholder="intents: price,order,info"
+                            value={agentForm.intents.join(',')}
+                            onChange={(event) =>
+                              setAgentForm((prev) => ({
+                                ...prev,
+                                intents: event.target.value.split(','),
+                              }))
+                            }
+                            className="h-9 sm:col-span-2"
+                          />
+                          <Input
+                            placeholder="variables: API_TOKEN,BASE_URL"
+                            value={agentForm.variables.join(',')}
+                            onChange={(event) =>
+                              setAgentForm((prev) => ({
+                                ...prev,
+                                variables: event.target.value.split(','),
+                              }))
+                            }
+                            className="h-9 sm:col-span-2"
+                          />
+                        </div>
+                        <Textarea
+                          placeholder="Agent markdown body instructions..."
+                          value={agentForm.body}
+                          onChange={(event) => setAgentForm((prev) => ({ ...prev, body: event.target.value }))}
+                          className="min-h-[130px] font-mono text-xs sm:min-h-[160px]"
+                        />
+                        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                          <Button size="sm" className="w-full sm:w-auto" onClick={() => void saveAgent()} disabled={busy}>
+                            <Save className="size-4" /> {editingAgentID ? 'Update Agent' : 'Create Agent'}
+                          </Button>
+                          <Button size="sm" variant="outline" className="w-full sm:w-auto" onClick={resetAgentForm} disabled={busy}>
+                            Clear
+                          </Button>
+                        </div>
+                        <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                          {agents.map((agent) => (
+                            <div key={agent.id} className="flex flex-col gap-2 border-b border-border/40 py-1 last:border-b-0 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0">
+                                <p className="break-all font-medium">{agent.id}</p>
+                                <p className="break-words text-xs text-muted-foreground">{agent.description || agent.name}</p>
                               </div>
-                              <Switch checked={value.toLowerCase() === 'true'} onCheckedChange={(checked) => updateSetting(key, checked ? 'true' : 'false')} />
+                              <div className="flex w-full gap-1 sm:w-auto">
+                                <Button size="sm" variant="outline" className="flex-1 sm:flex-none" onClick={() => startEditAgent(agent)}>Edit</Button>
+                                <Button size="sm" variant="destructive" className="flex-1 sm:flex-none" onClick={() => void deleteAgent(agent.id)}>Delete</Button>
+                              </div>
+                            </div>
+                          ))}
+                          {agents.length === 0 ? <p className="text-xs text-muted-foreground">No agents yet.</p> : null}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+
+                  {activePage === 'settings' && activeSettingsPage === 'setting' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Settings</CardTitle>
+                        <CardDescription>Only daily-use settings are shown. Advanced values are hidden and fixed.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        {MAIN_VISIBLE_SETTINGS.filter((key) => settingsKeys.includes(key)).map((key) => {
+                          const value = settingsValues[key] ?? ''
+                          if (booleanSettingKeys.has(key)) {
+                            return (
+                              <div key={key} className="flex items-center justify-between rounded-lg border border-border/60 bg-background p-2.5">
+                                <div>
+                                  <Label>{settingLabels[key] || key}</Label>
+                                  <p className="text-xs text-muted-foreground">Feature toggle</p>
+                                </div>
+                                <Switch checked={value.toLowerCase() === 'true'} onCheckedChange={(checked) => updateSetting(key, checked ? 'true' : 'false')} />
+                              </div>
+                            )
+                          }
+                          return (
+                            <div key={key} className="space-y-1">
+                              <Label>{settingLabels[key] || key}</Label>
+                              <Input
+                                type={secretSettingKeys.has(key) ? 'password' : numericSettingKeys.has(key) ? 'number' : 'text'}
+                                value={value}
+                                onChange={(event) => updateSetting(key, event.target.value)}
+                                className="h-9 text-sm"
+                              />
                             </div>
                           )
-                        }
-                        return (
-                          <div key={key} className="space-y-1">
-                            <Label>{settingLabels[key] || key}</Label>
-                            <Input
-                              type={secretSettingKeys.has(key) ? 'password' : numericSettingKeys.has(key) ? 'number' : 'text'}
-                              value={value}
-                              onChange={(event) => updateSetting(key, event.target.value)}
-                              className="h-9 text-sm"
-                            />
-                          </div>
-                        )
-                      })}
-                      <Button size="sm" onClick={() => void saveSettingsSubset(MAIN_VISIBLE_SETTINGS.filter((key) => settingsKeys.includes(key)), 'Settings saved')} disabled={busy}>
-                        <Save className="size-4" /> Save Settings
-                      </Button>
-                    </CardContent>
-                  </Card>
+                        })}
+                        <Button size="sm" onClick={() => void saveSettingsSubset(MAIN_VISIBLE_SETTINGS.filter((key) => settingsKeys.includes(key)), 'Settings saved')} disabled={busy}>
+                          <Save className="size-4" /> Save Settings
+                        </Button>
+                      </CardContent>
+                    </Card>
+                  ) : null}
 
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>SOUL Prompt</CardTitle>
-                      <CardDescription>Update personality profile used by AI reply context.</CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-3">
-                      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                        <Badge variant="outline">{soulCharacterCount} chars</Badge>
-                        <Badge variant="outline">Loaded: {formatLocalTime(soulLoadedAt)}</Badge>
-                        {soulSavedAt ? <Badge variant="outline">Saved: {formatLocalTime(soulSavedAt)}</Badge> : null}
-                      </div>
-                      <Textarea value={soulText} onChange={(event) => setSoulText(event.target.value)} className="min-h-[235px] font-mono text-xs" />
-                      <Button size="sm" onClick={() => void saveSoul()} disabled={busy}>
-                        <Save className="size-4" /> Save SOUL
-                      </Button>
-                    </CardContent>
-                  </Card>
-                </section>
-
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <Terminal className="size-4" /> Realtime Logs
-                    </CardTitle>
-                    <CardDescription>Streaming from backend SSE endpoint `/api/logs/stream`.</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="max-h-[380px] overflow-auto rounded-lg border border-border/60 bg-zinc-950 p-3 font-mono text-xs text-zinc-100">
-                      {logs.map((entry, index) => (
-                        <div key={`${entry.time}-${index}`} className="mb-1 break-all">
-                          <span className="text-zinc-400">[{entry.time}]</span>{' '}
-                          <span className={entry.level.includes('error') ? 'text-rose-300' : entry.level.includes('warn') ? 'text-amber-300' : 'text-emerald-300'}>
-                            {entry.level.toUpperCase()}
-                          </span>{' '}
-                          <span>{entry.message}</span>
+                  {activePage === 'settings' && activeSettingsPage === 'soul' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>SOUL Prompt</CardTitle>
+                        <CardDescription>Update personality profile used by AI reply context.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                          <Badge variant="outline">{soulCharacterCount} chars</Badge>
+                          <Badge variant="outline">Loaded: {formatLocalTime(soulLoadedAt)}</Badge>
+                          {soulSavedAt ? <Badge variant="outline">Saved: {formatLocalTime(soulSavedAt)}</Badge> : null}
                         </div>
-                      ))}
-                      {logs.length === 0 ? <p className="text-zinc-400">No logs yet.</p> : null}
-                    </div>
-                  </CardContent>
-                </Card>
+                        <Textarea value={soulText} onChange={(event) => setSoulText(event.target.value)} className="min-h-[235px] font-mono text-xs" />
+                        <Button size="sm" onClick={() => void saveSoul()} disabled={busy}>
+                          <Save className="size-4" /> Save SOUL
+                        </Button>
+                      </CardContent>
+                    </Card>
+                  ) : null}
 
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Account Security</CardTitle>
-                    <CardDescription>Change dashboard username and password used for admin login.</CardDescription>
-                  </CardHeader>
-                  <CardContent className="grid gap-3 md:grid-cols-2">
-                    <div className="space-y-1">
-                      <Label htmlFor="account-current-password">Current Password</Label>
-                      <Input
-                        id="account-current-password"
-                        type="password"
-                        value={currentAdminPassword}
-                        onChange={(event) => setCurrentAdminPassword(event.target.value)}
-                        className="h-9 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <Label htmlFor="account-username">New Username</Label>
-                      <Input
-                        id="account-username"
-                        value={newAdminUsername}
-                        onChange={(event) => setNewAdminUsername(event.target.value)}
-                        className="h-9 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <Label htmlFor="account-new-password">New Password</Label>
-                      <Input
-                        id="account-new-password"
-                        type="password"
-                        placeholder="Leave blank to keep current password"
-                        value={newAdminPassword}
-                        onChange={(event) => setNewAdminPassword(event.target.value)}
-                        className="h-9 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <Label htmlFor="account-confirm-password">Confirm Password</Label>
-                      <Input
-                        id="account-confirm-password"
-                        type="password"
-                        placeholder="Repeat new password"
-                        value={confirmAdminPassword}
-                        onChange={(event) => setConfirmAdminPassword(event.target.value)}
-                        className="h-9 text-sm"
-                      />
-                    </div>
-                    <div className="md:col-span-2 flex flex-wrap items-center gap-2">
-                      <Button size="sm" onClick={() => void updateAdminCredentials()} disabled={busy}>
-                        <ShieldCheck className="size-4" /> Update Dashboard Account
-                      </Button>
-                      <span className="text-xs text-muted-foreground">After update, dashboard login is required again.</span>
-                    </div>
-                  </CardContent>
-                </Card>
-              </>
+                  {activePage === 'settings' && activeSettingsPage === 'telegram' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Telegram</CardTitle>
+                        <CardDescription>Connection and account actions.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-lg border border-border/60 bg-background p-3">
+                            <p className="text-xs uppercase tracking-wide text-muted-foreground">Status</p>
+                            <p className="mt-1 text-sm font-semibold">{telegramConnection.label}</p>
+                          </div>
+                          <div className="rounded-lg border border-border/60 bg-background p-3">
+                            <p className="text-xs uppercase tracking-wide text-muted-foreground">Phone</p>
+                            <p className="mt-1 text-sm font-semibold">{telegramPhoneLabel}</p>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button size="sm" variant="outline" onClick={() => void logoutTelegram()} disabled={busy || !authStatus.authorized}>
+                            <LogOut className="size-4" /> Telegram Sign Out
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+
+                  {activePage === 'settings' && activeSettingsPage === 'variables' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Global Variables</CardTitle>
+                        <CardDescription>Typed variables (`text`, `secret`) for agent interpolation and api_call tool.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="grid gap-2 md:grid-cols-3">
+                          <Input
+                            placeholder="KEY_NAME"
+                            value={variableForm.key}
+                            onChange={(event) => setVariableForm((prev) => ({ ...prev, key: event.target.value }))}
+                            className="h-9"
+                          />
+                          <select
+                            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                            value={variableForm.type}
+                            onChange={(event) => setVariableForm((prev) => ({ ...prev, type: event.target.value as 'text' | 'secret' }))}
+                          >
+                            <option value="text">text</option>
+                            <option value="secret">secret</option>
+                          </select>
+                          <Input
+                            type={variableForm.type === 'secret' ? 'password' : 'text'}
+                            placeholder="value"
+                            value={variableForm.value}
+                            onChange={(event) => setVariableForm((prev) => ({ ...prev, value: event.target.value }))}
+                            className="h-9"
+                          />
+                        </div>
+                        <Button size="sm" onClick={() => void saveVariable()} disabled={busy}>
+                          <Save className="size-4" /> Save Variable
+                        </Button>
+                        <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                          {variables.map((v) => (
+                            <div key={v.key} className="flex flex-col gap-2 border-b border-border/40 py-1 last:border-b-0 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0">
+                                <p className="font-medium">{v.key}</p>
+                                <p className="text-xs text-muted-foreground">
+                                  {v.type} • {v.value}
+                                </p>
+                              </div>
+                              <div className="flex w-full gap-1 sm:w-auto">
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="w-full sm:w-auto"
+                                  onClick={() => setVariableForm({ key: v.key, type: v.type, value: '' })}
+                                >
+                                  Edit
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  className="w-full sm:w-auto"
+                                  onClick={() => void deleteVariable(v.key)}
+                                >
+                                  Delete
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                          {variables.length === 0 ? <p className="text-xs text-muted-foreground">No variables yet.</p> : null}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+
+                  {activePage === 'settings' && activeSettingsPage === 'user' ? (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>User</CardTitle>
+                        <CardDescription>Change dashboard username and password used for admin login.</CardDescription>
+                      </CardHeader>
+                      <CardContent className="grid gap-3 md:grid-cols-2">
+                        <div className="space-y-1">
+                          <Label htmlFor="account-current-password">Current Password</Label>
+                          <Input
+                            id="account-current-password"
+                            type="password"
+                            value={currentAdminPassword}
+                            onChange={(event) => setCurrentAdminPassword(event.target.value)}
+                            className="h-9 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="account-username">New Username</Label>
+                          <Input
+                            id="account-username"
+                            value={newAdminUsername}
+                            onChange={(event) => setNewAdminUsername(event.target.value)}
+                            className="h-9 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="account-new-password">New Password</Label>
+                          <Input
+                            id="account-new-password"
+                            type="password"
+                            placeholder="Leave blank to keep current password"
+                            value={newAdminPassword}
+                            onChange={(event) => setNewAdminPassword(event.target.value)}
+                            className="h-9 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="account-confirm-password">Confirm Password</Label>
+                          <Input
+                            id="account-confirm-password"
+                            type="password"
+                            placeholder="Repeat new password"
+                            value={confirmAdminPassword}
+                            onChange={(event) => setConfirmAdminPassword(event.target.value)}
+                            className="h-9 text-sm"
+                          />
+                        </div>
+                        <div className="md:col-span-2 flex flex-col items-start gap-2 sm:flex-row sm:items-center">
+                          <Button size="sm" className="w-full sm:w-auto" onClick={() => void updateAdminCredentials()} disabled={busy}>
+                            <ShieldCheck className="size-4" /> Update Dashboard Account
+                          </Button>
+                          <span className="text-xs text-muted-foreground">After update, dashboard login is required again.</span>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ) : null}
+                </div>
+              </div>
+            </div>
             )}
           </>
         )}
       </div>
+      <AlertDialog
+        open={confirmDialog.open}
+        onOpenChange={(open) => {
+          if (!open && !busy) {
+            closeConfirmDialog(false)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{confirmDialog.title}</AlertDialogTitle>
+            <AlertDialogDescription>{confirmDialog.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy}
+              className={
+                confirmDialog.confirmVariant === 'destructive'
+                  ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90'
+                  : undefined
+              }
+              onClick={(event) => {
+                event.preventDefault()
+                void handleConfirmAction()
+              }}
+            >
+              {busy ? 'Processing...' : confirmDialog.confirmLabel}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </main>
   )
 }

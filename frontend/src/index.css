@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,65 +6,65 @@
 
 @layer base {
   :root {
-    --background: 38 46% 97%;
-    --foreground: 24 24% 16%;
+    --background: 195 36% 97%;
+    --foreground: 208 38% 13%;
 
     --card: 0 0% 100%;
-    --card-foreground: 24 24% 16%;
+    --card-foreground: 208 38% 13%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 24 24% 16%;
+    --popover-foreground: 208 38% 13%;
 
-    --primary: 23 90% 48%;
-    --primary-foreground: 40 100% 98%;
+    --primary: 187 78% 37%;
+    --primary-foreground: 180 25% 96%;
 
-    --secondary: 166 33% 86%;
-    --secondary-foreground: 172 54% 18%;
+    --secondary: 158 35% 88%;
+    --secondary-foreground: 165 44% 21%;
 
-    --muted: 40 28% 92%;
-    --muted-foreground: 25 12% 42%;
+    --muted: 195 24% 91%;
+    --muted-foreground: 207 17% 41%;
 
-    --accent: 48 91% 88%;
-    --accent-foreground: 30 35% 24%;
+    --accent: 39 93% 87%;
+    --accent-foreground: 30 57% 22%;
 
-    --destructive: 0 80% 52%;
+    --destructive: 0 74% 50%;
     --destructive-foreground: 0 0% 98%;
 
-    --border: 28 22% 82%;
-    --input: 28 22% 82%;
-    --ring: 23 90% 48%;
+    --border: 200 22% 80%;
+    --input: 200 22% 80%;
+    --ring: 187 78% 37%;
 
-    --radius: 0.85rem;
+    --radius: 0.95rem;
   }
 
   .dark {
-    --background: 24 20% 9%;
-    --foreground: 35 40% 96%;
+    --background: 208 35% 9%;
+    --foreground: 189 20% 93%;
 
-    --card: 24 19% 12%;
-    --card-foreground: 35 40% 96%;
+    --card: 208 28% 12%;
+    --card-foreground: 189 20% 93%;
 
-    --popover: 24 19% 12%;
-    --popover-foreground: 35 40% 96%;
+    --popover: 208 28% 12%;
+    --popover-foreground: 189 20% 93%;
 
-    --primary: 30 92% 58%;
-    --primary-foreground: 20 100% 8%;
+    --primary: 186 72% 46%;
+    --primary-foreground: 205 40% 8%;
 
-    --secondary: 172 35% 22%;
-    --secondary-foreground: 160 40% 90%;
+    --secondary: 172 28% 21%;
+    --secondary-foreground: 164 42% 88%;
 
-    --muted: 25 14% 20%;
-    --muted-foreground: 36 13% 70%;
+    --muted: 209 18% 19%;
+    --muted-foreground: 202 13% 72%;
 
-    --accent: 48 65% 28%;
-    --accent-foreground: 43 97% 89%;
+    --accent: 39 61% 26%;
+    --accent-foreground: 44 89% 86%;
 
-    --destructive: 0 62% 42%;
+    --destructive: 0 64% 44%;
     --destructive-foreground: 0 0% 98%;
 
-    --border: 24 14% 25%;
-    --input: 24 14% 25%;
-    --ring: 30 92% 58%;
+    --border: 208 14% 27%;
+    --input: 208 14% 27%;
+    --ring: 186 72% 46%;
   }
 
   * {
@@ -73,21 +73,99 @@
 
   body {
     @apply bg-background text-foreground antialiased;
-    font-family: 'Sora', sans-serif;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    min-height: 100vh;
+    position: relative;
     background-image:
-      radial-gradient(circle at 10% 5%, rgba(251, 191, 36, 0.14), transparent 36%),
-      radial-gradient(circle at 90% 10%, rgba(20, 184, 166, 0.14), transparent 34%),
-      radial-gradient(circle at 50% 90%, rgba(249, 115, 22, 0.1), transparent 40%);
+      radial-gradient(circle at 8% 6%, rgba(34, 197, 194, 0.16), transparent 34%),
+      radial-gradient(circle at 90% 12%, rgba(245, 158, 11, 0.13), transparent 32%),
+      radial-gradient(circle at 50% 92%, rgba(14, 165, 233, 0.09), transparent 42%),
+      linear-gradient(135deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0));
+    background-attachment: fixed;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      transparent calc(100% - 1px),
+      rgba(15, 23, 42, 0.035) calc(100% - 1px),
+      rgba(15, 23, 42, 0.035) 100%
+    );
+    background-size: 100% 24px;
+    opacity: 0.28;
+    z-index: -1;
   }
 
   code,
   pre,
   .font-mono {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'JetBrains Mono', monospace;
   }
 
   .font-display {
-    font-family: 'Sora', sans-serif;
-    font-weight: 700;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+
+  .font-brand {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 500;
+    letter-spacing: -0.04em;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.24);
+    color: hsl(var(--foreground));
+  }
+}
+
+@layer components {
+  .rounded-2xl,
+  .rounded-xl {
+    backdrop-filter: blur(4px);
+  }
+
+  .shadow-sm {
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.05),
+      0 12px 32px rgba(15, 23, 42, 0.06);
+  }
+
+  button {
+    transition:
+      transform 140ms ease,
+      box-shadow 180ms ease,
+      background-color 180ms ease,
+      color 180ms ease,
+      border-color 180ms ease;
+  }
+
+  button:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  button:active:not(:disabled) {
+    transform: translateY(0);
+  }
+
+  .animate-enter {
+    animation: enter-rise 440ms ease both;
+  }
+}
+
+@keyframes enter-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
