@@ -277,6 +277,7 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 	}
 
 	reply := ""
+	replySource := "none"
 	if s.orch != nil {
 		reply, err = s.orch.Handle(ctx, orchestrator.MessageContext{
 			ChatID:         chatID,
@@ -287,9 +288,18 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		}, s.soulPrompt)
 		if err != nil {
 			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
+		} else if strings.TrimSpace(reply) != "" {
+			replySource = "orchestrator"
 		}
+	} else {
+		s.logger.Warn("orchestrator unavailable; fallback to legacy reply", "chat_id", chatID, "message_id", triggerID)
 	}
 	if strings.TrimSpace(reply) == "" {
+		s.logger.Info("using legacy ai fallback",
+			"chat_id", chatID,
+			"message_id", triggerID,
+			"reason", "orchestrator_empty_or_unavailable",
+		)
 		systemPrompt, userPrompt := contextbuilder.Build(
 			s.chatNameFromPeer(ctx, entities, peerID),
 			toContextLines(history),
@@ -301,6 +311,7 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 			_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "ai_error", err.Error())
 			return fmt.Errorf("ai generate: %w", err)
 		}
+		replySource = "legacy_ai"
 	}
 	if strings.TrimSpace(reply) == "" {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_empty", "AI returned blank text")
@@ -323,8 +334,23 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 		s.logger.Warn("failed to mark auto reply sent", "error", err.Error())
 	}
 
-	s.logger.Info("Auto-reply sent", "chat_id", chatID, "message_id", triggerID, "context_count", len(history))
+	s.logger.Info(
+		"Auto-reply sent",
+		"chat_id", chatID,
+		"message_id", triggerID,
+		"context_count", len(history),
+		"source", replySource,
+		"reply_preview", truncatePreview(reply, 220),
+	)
 	return nil
+}
+
+func truncatePreview(text string, max int) string {
+	v := util.NormalizeSpace(text)
+	if max <= 0 || len(v) <= max {
+		return v
+	}
+	return v[:max] + "...(truncated)"
 }
 
 func (s *Service) normalizeHistory(messages []tg.MessageClass) []historyEntry {

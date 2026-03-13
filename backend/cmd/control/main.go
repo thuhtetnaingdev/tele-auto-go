@@ -137,6 +137,7 @@ func main() {
 	mux.HandleFunc("/api/service/restart", server.requireAdmin(server.handleServiceRestart))
 	mux.HandleFunc("/api/settings", server.requireAdmin(server.handleSettings))
 	mux.HandleFunc("/api/variables", server.requireAdmin(server.handleVariables))
+	mux.HandleFunc("/api/variables/", server.requireAdmin(server.handleVariableByKey))
 	mux.HandleFunc("/api/agents", server.requireAdmin(server.handleAgents))
 	mux.HandleFunc("/api/agents/", server.requireAdmin(server.handleAgentByID))
 	mux.HandleFunc("/api/soul", server.requireAdmin(server.handleSoul))
@@ -729,6 +730,28 @@ func (s *apiServer) handleVariables(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *apiServer) handleVariableByKey(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/variables/"))
+	if key == "" || strings.Contains(key, "/") {
+		errorJSON(w, http.StatusNotFound, errors.New("variable not found"))
+		return
+	}
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+	deleted, err := s.db.DeleteGlobalVariable(r.Context(), key)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if !deleted {
+		errorJSON(w, http.StatusNotFound, errors.New("variable not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *apiServer) handleAgents(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -736,6 +759,7 @@ func (s *apiServer) handleAgents(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req upsertAgentRequest
 		if err := decodeJSON(r, &req); err != nil {
+			s.logger.Warn("agent create decode failed", "error", err.Error())
 			errorJSON(w, http.StatusBadRequest, err)
 			return
 		}
@@ -751,10 +775,23 @@ func (s *apiServer) handleAgents(w http.ResponseWriter, r *http.Request) {
 			Body:        req.Body,
 		})
 		if err != nil {
+			s.logger.Warn("agent create failed", "id", strings.TrimSpace(req.ID), "error", err.Error())
 			errorJSON(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent})
+		restarted := false
+		if s.manager.Status().Running {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			if err := s.manager.Restart(ctx); err != nil {
+				s.logger.Warn("agent create restart failed", "id", agent.ID, "error", err.Error())
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+			restarted = true
+		}
+		s.logger.Info("agent created", "id", agent.ID)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent, "restarted": restarted})
 	default:
 		methodNotAllowed(w)
 	}
@@ -777,6 +814,7 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var req upsertAgentRequest
 		if err := decodeJSON(r, &req); err != nil {
+			s.logger.Warn("agent update decode failed", "id", id, "error", err.Error())
 			errorJSON(w, http.StatusBadRequest, err)
 			return
 		}
@@ -784,6 +822,7 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 			req.ID = id
 		}
 		if strings.TrimSpace(req.ID) != id {
+			s.logger.Warn("agent update id mismatch", "path_id", id, "body_id", strings.TrimSpace(req.ID))
 			errorJSON(w, http.StatusBadRequest, errors.New("id mismatch"))
 			return
 		}
@@ -799,10 +838,23 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 			Body:        req.Body,
 		})
 		if err != nil {
+			s.logger.Warn("agent update failed", "id", id, "error", err.Error())
 			errorJSON(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent})
+		restarted := false
+		if s.manager.Status().Running {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			if err := s.manager.Restart(ctx); err != nil {
+				s.logger.Warn("agent update restart failed", "id", agent.ID, "error", err.Error())
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+			restarted = true
+		}
+		s.logger.Info("agent updated", "id", agent.ID)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agent": agent, "restarted": restarted})
 	case http.MethodDelete:
 		if err := s.agentMgr.Delete(id); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "not found") {
@@ -812,7 +864,19 @@ func (s *apiServer) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 			errorJSON(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		restarted := false
+		if s.manager.Status().Running {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			if err := s.manager.Restart(ctx); err != nil {
+				s.logger.Warn("agent delete restart failed", "id", id, "error", err.Error())
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+			restarted = true
+		}
+		s.logger.Info("agent deleted", "id", id)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restarted": restarted})
 	default:
 		methodNotAllowed(w)
 	}

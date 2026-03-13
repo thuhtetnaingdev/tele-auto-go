@@ -71,6 +71,7 @@ Default API address: `http://localhost:3000`
 - `PUT /api/settings`
 - `GET /api/variables`
 - `PUT /api/variables`
+- `DELETE /api/variables/:key`
 - `GET /api/agents`
 - `POST /api/agents`
 - `GET /api/agents/:id`

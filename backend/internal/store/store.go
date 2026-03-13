@@ -208,6 +208,22 @@ func (s *Store) GlobalVariablesMap(ctx context.Context) (map[string]string, map[
 	return values, types, nil
 }
 
+func (s *Store) DeleteGlobalVariable(ctx context.Context, key string) (bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false, fmt.Errorf("variable key is required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM global_variables WHERE key = ? OR UPPER(key) = UPPER(?)`, key, key)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func (s *Store) SaveOrchestrationRun(ctx context.Context, run OrchestrationRun) error {
 	if strings.TrimSpace(run.Status) == "" {
 		run.Status = "unknown"

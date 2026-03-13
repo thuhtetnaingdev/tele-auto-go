@@ -75,69 +75,98 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 	agentList := e.agents.List()
 	if len(agentList) == 0 {
 		run.ErrorMessage = "no agents configured"
-		return "Sorry, no agent is configured yet.", nil
+		return e.fail(mc, run, started, "load_agents", "Sorry, no agent is configured yet.")
 	}
 
 	vars, types, err := e.store.GlobalVariablesMap(ctx)
 	if err != nil {
 		run.ErrorMessage = "load variables: " + err.Error()
-		return "Sorry, failed to load runtime variables.", nil
+		return e.fail(mc, run, started, "load_variables", "Sorry, failed to load runtime variables.")
 	}
 
 	route, err := e.routeAgent(ctx, mc, agentList)
 	if err != nil {
 		run.ErrorMessage = "route agent: " + err.Error()
-		return "Sorry, I couldn't decide the right handler right now.", nil
+		return e.fail(mc, run, started, "route_agent", "Sorry, I couldn't decide the right handler right now.")
 	}
 	run.SelectedAgentID = route.AgentID
 	run.RouterReason = route.Reason
 	run.RouterConfidence = route.Confidence
+	e.logger.Info("orchestrator_routed",
+		"chat_id", mc.ChatID,
+		"trigger_message", mc.TriggerMessage,
+		"agent_id", route.AgentID,
+		"reason", route.Reason,
+		"confidence", route.Confidence,
+	)
 
 	agent, ok := e.agents.Get(route.AgentID)
 	if !ok {
 		run.ErrorMessage = "agent not found: " + route.AgentID
-		return "Sorry, selected agent is unavailable.", nil
+		return e.fail(mc, run, started, "load_selected_agent", "Sorry, selected agent is unavailable.")
 	}
 
 	if err := ensureRequiredVariables(agent.Variables, vars); err != nil {
 		e.logger.Warn("orchestrator missing required variables", "agent_id", agent.ID, "error", err.Error())
 		run.ErrorMessage = err.Error()
-		return "Sorry, system configuration is incomplete for this request.", nil
+		return e.fail(mc, run, started, "validate_required_variables", "Sorry, system configuration is incomplete for this request.")
 	}
 
 	agentInstructions, err := interpolateVars(agent.Body, vars)
 	if err != nil {
 		run.ErrorMessage = "interpolate agent body: " + err.Error()
-		return "Sorry, failed to load agent instructions.", nil
+		return e.fail(mc, run, started, "interpolate_agent_body", "Sorry, failed to load agent instructions.")
 	}
+	e.logger.Info("orchestrator_agent_loaded",
+		"chat_id", mc.ChatID,
+		"trigger_message", mc.TriggerMessage,
+		"agent_id", agent.ID,
+		"agent_updated_at", agent.UpdatedAt,
+		"agent_body_preview", truncateText(agentInstructions, 260),
+	)
 
 	decision, err := e.decideToolCall(ctx, agent, agentInstructions, mc, soulPrompt)
 	if err != nil {
 		run.ErrorMessage = "tool decide: " + err.Error()
-		return "Sorry, failed to process request.", nil
+		return e.fail(mc, run, started, "decide_tool_call", "Sorry, failed to process request.")
 	}
+	e.logger.Info("orchestrator_tool_decision",
+		"chat_id", mc.ChatID,
+		"trigger_message", mc.TriggerMessage,
+		"agent_id", agent.ID,
+		"call_tool", decision.CallTool,
+		"tool", decision.Tool,
+		"tool_args_method", strings.ToUpper(strings.TrimSpace(decision.ToolArgs.Method)),
+		"tool_args_url", decision.ToolArgs.URL,
+		"tool_args_query", decision.ToolArgs.Query,
+		"tool_args_headers", redactHeaders(decision.ToolArgs.Headers),
+		"tool_args_headers_raw", decision.ToolArgs.Headers,
+		"tool_args_json_body", redactAny(decision.ToolArgs.JSONBody),
+		"tool_args_json_body_raw", decision.ToolArgs.JSONBody,
+		"direct_response_preview", truncateText(decision.DirectResponse, 240),
+	)
 
 	toolResp := apiToolResponse{}
 	if decision.CallTool {
-		toolResp, err = e.executeAPITool(ctx, decision.ToolArgs, vars)
+		toolResp, err = e.executeAPITool(ctx, decision.ToolArgs, vars, agent.ID, mc.ChatID)
 		run.ToolName = "api_call"
 		run.ToolStatus = strconv.Itoa(toolResp.Status)
 		if err != nil {
 			run.ErrorMessage = "api_call: " + err.Error()
-			return "Sorry, external API call failed right now.", nil
+			return e.fail(mc, run, started, "execute_api_tool", "Sorry, external API call failed right now.")
 		}
 	}
 
 	finalReply, err := e.synthesize(ctx, agent, agentInstructions, mc, decision, toolResp, soulPrompt, types)
 	if err != nil {
 		run.ErrorMessage = "synthesize: " + err.Error()
-		return "Sorry, failed to compose final response.", nil
+		return e.fail(mc, run, started, "synthesize_reply", "Sorry, failed to compose final response.")
 	}
 
 	finalReply = util.NormalizeSpace(util.StripThinking(finalReply))
 	if finalReply == "" {
 		run.ErrorMessage = "empty final reply"
-		return "", nil
+		return e.fail(mc, run, started, "empty_final_reply", "")
 	}
 
 	run.Status = "success"
@@ -176,19 +205,36 @@ type apiToolResponse struct {
 }
 
 func (e *Engine) routeAgent(ctx context.Context, mc MessageContext, agentsList []agents.Agent) (RouterResult, error) {
+	if routed, ok := routeByKeywords(mc.LatestIncoming, agentsList); ok {
+		return routed, nil
+	}
+
 	type lite struct {
 		ID          string   `json:"id"`
 		Name        string   `json:"name"`
 		Description string   `json:"description"`
 		Intents     []string `json:"intents"`
+		BodyHint    string   `json:"body_hint,omitempty"`
 	}
 	catalog := make([]lite, 0, len(agentsList))
 	for _, agent := range agentsList {
-		catalog = append(catalog, lite{ID: agent.ID, Name: agent.Name, Description: agent.Description, Intents: agent.Intents})
+		catalog = append(catalog, lite{
+			ID:          agent.ID,
+			Name:        agent.Name,
+			Description: agent.Description,
+			Intents:     agent.Intents,
+			BodyHint:    truncateText(agent.Body, 260),
+		})
 	}
 	cb, _ := json.Marshal(catalog)
 
-	systemPrompt := "You are a strict agent router. Return only JSON: {\"agent_id\": string, \"reason\": string, \"confidence\": number}. agent_id must be exactly one from catalog."
+	systemPrompt := strings.Join([]string{
+		"You are a strict agent router.",
+		"Return only JSON: {\"agent_id\": string, \"reason\": string, \"confidence\": number}.",
+		"agent_id must be exactly one from catalog.",
+		"Prefer the most specific domain agent when message indicates that domain.",
+		"Use general_assistant only as fallback for broad/unknown requests.",
+	}, "\n")
 	userPrompt := strings.Join([]string{
 		"User message:",
 		mc.LatestIncoming,
@@ -269,6 +315,22 @@ func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentIn
 
 	decision := toolDecision{}
 	if err := parseJSONLike(out, &decision); err != nil {
+		rawDecision := map[string]any{}
+		if parseJSONLike(out, &rawDecision) == nil {
+			e.logger.Warn("orchestrator_tool_decision_parse_failed",
+				"chat_id", mc.ChatID,
+				"agent_id", agent.ID,
+				"error", err.Error(),
+				"raw_decision", rawDecision,
+			)
+		} else {
+			e.logger.Warn("orchestrator_tool_decision_parse_failed",
+				"chat_id", mc.ChatID,
+				"agent_id", agent.ID,
+				"error", err.Error(),
+				"raw_output", truncateText(out, 4000),
+			)
+		}
 		return toolDecision{}, err
 	}
 	if strings.TrimSpace(decision.Tool) == "" {
@@ -334,7 +396,8 @@ func (e *Engine) synthesize(
 	})
 }
 
-func (e *Engine) executeAPITool(ctx context.Context, args apiToolArgs, vars map[string]string) (apiToolResponse, error) {
+func (e *Engine) executeAPITool(ctx context.Context, args apiToolArgs, vars map[string]string, agentID, chatID string) (apiToolResponse, error) {
+	started := time.Now()
 	method := strings.ToUpper(strings.TrimSpace(args.Method))
 	if method == "" {
 		method = http.MethodGet
@@ -375,6 +438,21 @@ func (e *Engine) executeAPITool(ctx context.Context, args apiToolArgs, vars map[
 	if err != nil {
 		return apiToolResponse{}, err
 	}
+
+	e.logger.Info("agent_tool_call_request",
+		"chat_id", chatID,
+		"agent_id", agentID,
+		"tool", "api_call",
+		"method", method,
+		"url", urlValue,
+		"query", query,
+		"headers", redactHeaders(headers),
+		"headers_raw", headers,
+		"json_body", redactAny(resolvedBody),
+		"json_body_raw", resolvedBody,
+		"timeout_ms", args.TimeoutMS,
+	)
+
 	bodyBytes, _ := json.Marshal(resolvedBody)
 	if method == http.MethodGet || method == http.MethodDelete {
 		bodyBytes = nil
@@ -400,6 +478,20 @@ func (e *Engine) executeAPITool(ctx context.Context, args apiToolArgs, vars map[
 	httpClient.Timeout = time.Duration(args.TimeoutMS) * time.Millisecond
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		e.logger.Error("agent_tool_call_error",
+			"chat_id", chatID,
+			"agent_id", agentID,
+			"tool", "api_call",
+			"method", method,
+			"url", urlValue,
+			"query", query,
+			"headers", redactHeaders(headers),
+			"headers_raw", headers,
+			"json_body", redactAny(resolvedBody),
+			"json_body_raw", resolvedBody,
+			"error", err.Error(),
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
 		return apiToolResponse{}, err
 	}
 	defer resp.Body.Close()
@@ -428,6 +520,19 @@ func (e *Engine) executeAPITool(ctx context.Context, args apiToolArgs, vars map[
 	if json.Unmarshal(respBody, &parsed) == nil {
 		out.BodyJSON = parsed
 	}
+
+	e.logger.Info("agent_tool_call_response",
+		"chat_id", chatID,
+		"agent_id", agentID,
+		"tool", "api_call",
+		"method", method,
+		"url", urlValue,
+		"status", out.Status,
+		"response_headers", normalizedHeaders,
+		"response_body_json", redactAny(out.BodyJSON),
+		"response_body_text", truncateText(out.BodyText, 2000),
+		"duration_ms", time.Since(started).Milliseconds(),
+	)
 	return out, nil
 }
 
@@ -516,4 +621,229 @@ func maxFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+func (e *Engine) fail(mc MessageContext, run store.OrchestrationRun, started time.Time, stage, userReply string) (string, error) {
+	e.logger.Warn("orchestrator_failure",
+		"chat_id", mc.ChatID,
+		"trigger_message", mc.TriggerMessage,
+		"stage", stage,
+		"agent_id", run.SelectedAgentID,
+		"tool", run.ToolName,
+		"tool_status", run.ToolStatus,
+		"error", run.ErrorMessage,
+		"duration_ms", time.Since(started).Milliseconds(),
+	)
+	return userReply, nil
+}
+
+func routeByKeywords(message string, agentsList []agents.Agent) (RouterResult, bool) {
+	if len(agentsList) == 0 {
+		return RouterResult{}, false
+	}
+	msgNorm := normalizeRouteText(message)
+	if msgNorm == "" {
+		return RouterResult{}, false
+	}
+	msgWords := wordsSet(msgNorm)
+	bestScore := 0
+	bestAgent := agents.Agent{}
+	bestMatches := []string{}
+
+	for _, agent := range agentsList {
+		score, matches := scoreAgentKeywords(msgNorm, msgWords, agent)
+		if score == 0 {
+			continue
+		}
+		if score > bestScore || (score == bestScore && preferAgent(agent, bestAgent)) {
+			bestScore = score
+			bestAgent = agent
+			bestMatches = matches
+		}
+	}
+
+	if bestScore < 3 || strings.TrimSpace(bestAgent.ID) == "" {
+		return RouterResult{}, false
+	}
+	conf := 0.55 + (float64(bestScore) * 0.06)
+	if conf > 0.95 {
+		conf = 0.95
+	}
+	return RouterResult{
+		AgentID:    bestAgent.ID,
+		Reason:     fmt.Sprintf("keyword route matched %s (score=%d)", strings.Join(bestMatches, ","), bestScore),
+		Confidence: conf,
+	}, true
+}
+
+func scoreAgentKeywords(msgNorm string, msgWords map[string]struct{}, agent agents.Agent) (int, []string) {
+	score := 0
+	matches := []string{}
+
+	for _, intent := range agent.Intents {
+		phrase := normalizeRouteText(strings.ReplaceAll(intent, "_", " "))
+		if phrase == "" {
+			continue
+		}
+		if containsRoutePhrase(msgNorm, phrase) {
+			score += 6
+			matches = append(matches, "intent:"+intent)
+		}
+		tokens := strings.Fields(phrase)
+		acr := acronym(tokens)
+		if len(acr) >= 2 {
+			if _, ok := msgWords[acr]; ok {
+				score += 4
+				matches = append(matches, "acronym:"+acr)
+			}
+		}
+		for _, token := range tokens {
+			if len(token) < 4 {
+				continue
+			}
+			if _, ok := msgWords[token]; ok {
+				score += 1
+				matches = append(matches, "token:"+token)
+			}
+		}
+	}
+
+	idPhrase := normalizeRouteText(strings.ReplaceAll(agent.ID, "_", " "))
+	if idPhrase != "" && containsRoutePhrase(msgNorm, idPhrase) {
+		score += 4
+		matches = append(matches, "id")
+	}
+	namePhrase := normalizeRouteText(agent.Name)
+	if namePhrase != "" && containsRoutePhrase(msgNorm, namePhrase) {
+		score += 3
+		matches = append(matches, "name")
+	}
+
+	return score, dedupeStrings(matches)
+}
+
+func preferAgent(candidate, current agents.Agent) bool {
+	if strings.TrimSpace(current.ID) == "" {
+		return true
+	}
+	cCandidate := strings.Contains(strings.ToLower(candidate.ID), "general")
+	cCurrent := strings.Contains(strings.ToLower(current.ID), "general")
+	if cCandidate == cCurrent {
+		return strings.TrimSpace(candidate.ID) < strings.TrimSpace(current.ID)
+	}
+	return !cCandidate && cCurrent
+}
+
+func normalizeRouteText(s string) string {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	if lower == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range lower {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func wordsSet(s string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, w := range strings.Fields(s) {
+		out[w] = struct{}{}
+	}
+	return out
+}
+
+func containsRoutePhrase(text, phrase string) bool {
+	if text == "" || phrase == "" {
+		return false
+	}
+	textPadded := " " + text + " "
+	phrasePadded := " " + phrase + " "
+	return strings.Contains(textPadded, phrasePadded)
+}
+
+func acronym(tokens []string) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		b.WriteByte(token[0])
+	}
+	return b.String()
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func redactHeaders(headers map[string]string) map[string]string {
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if strings.Contains(lk, "authorization") || strings.Contains(lk, "api-key") || strings.Contains(lk, "token") || strings.Contains(lk, "secret") || strings.Contains(lk, "cookie") {
+			out[k] = "***REDACTED***"
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func redactAny(value any) any {
+	switch t := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, v := range t {
+			lk := strings.ToLower(strings.TrimSpace(k))
+			if strings.Contains(lk, "authorization") || strings.Contains(lk, "api-key") || strings.Contains(lk, "token") || strings.Contains(lk, "secret") || strings.Contains(lk, "password") || strings.Contains(lk, "cookie") {
+				out[k] = "***REDACTED***"
+				continue
+			}
+			out[k] = redactAny(v)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(t))
+		for _, item := range t {
+			out = append(out, redactAny(item))
+		}
+		return out
+	case string:
+		return truncateText(t, 2000)
+	default:
+		return value
+	}
+}
+
+func truncateText(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncated)"
 }
