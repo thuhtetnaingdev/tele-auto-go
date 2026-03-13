@@ -225,6 +225,7 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>({ authorized: false, configured: false })
   const [serviceStatus, setServiceStatus] = useState<ServiceStatus>({ running: false })
   const [settings, setSettings] = useState<SettingsResponse>({ keys: [], values: {} })
+  const [savedSettings, setSavedSettings] = useState<SettingsResponse>({ keys: [], values: {} })
   const [soulText, setSoulText] = useState('')
   const [soulLoadedAt, setSoulLoadedAt] = useState('')
   const [soulSavedAt, setSoulSavedAt] = useState('')
@@ -267,10 +268,11 @@ export default function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
   const settingsValues = settings && settings.values && typeof settings.values === 'object' ? settings.values : {}
+  const savedSettingsValues = savedSettings && savedSettings.values && typeof savedSettings.values === 'object' ? savedSettings.values : {}
   const settingsKeys = settings && Array.isArray(settings.keys) ? settings.keys : []
   const requiredMissing = useMemo(
-    () => ONBOARDING_REQUIRED_KEYS.filter((key) => !(settingsValues[key] || '').trim()),
-    [settingsValues],
+    () => ONBOARDING_REQUIRED_KEYS.filter((key) => !(savedSettingsValues[key] || '').trim()),
+    [savedSettingsValues],
   )
 
   const needsConfig = requiredMissing.length > 0
@@ -321,6 +323,7 @@ export default function App() {
       setServiceStatus(service)
       const normalizedSettings = normalizeSettings(settingsData)
       setSettings(normalizedSettings)
+      setSavedSettings(normalizedSettings)
       setSoulText(soul.content || '')
       setSoulLoadedAt(new Date().toISOString())
       setLogs(logPayload.logs || [])
