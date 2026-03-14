@@ -1380,6 +1380,12 @@ export function useControlCenter() {
   }
 
   const openPage = (page: MainPage) => {
+    if (needsConfig && page !== 'dashboard') {
+      setMessage('Complete Step 1 required settings first.')
+      void navigate({ to: '/dashboard' })
+      setMobileNavOpen(false)
+      return
+    }
     const to = page === 'dashboard'
       ? '/dashboard'
       : page === 'logs'
@@ -1392,9 +1398,24 @@ export function useControlCenter() {
   }
 
   const openSettingsPage = (page: SettingsPage) => {
+    if (needsConfig) {
+      setMessage('Complete Step 1 required settings first.')
+      void navigate({ to: '/dashboard' })
+      setMobileNavOpen(false)
+      return
+    }
     void navigate({ to: `/settings/${page}` })
     setMobileNavOpen(false)
   }
+
+  useEffect(() => {
+    if (!needsConfig) {
+      return
+    }
+    if (activePage !== 'dashboard') {
+      void navigate({ to: '/dashboard' })
+    }
+  }, [needsConfig, activePage, navigate])
 
 
   return {
