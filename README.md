@@ -13,7 +13,23 @@ make dev
 
 ## Production One-Liner Install
 
-1. Build release artifacts locally:
+### Auto Release via GitHub Actions
+
+Push a version tag and GitHub Actions will build and publish the release assets automatically:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This workflow uploads:
+- `tele-auto-go_v1.0.0_linux_amd64.tar.gz`
+- `tele-auto-go_v1.0.0_linux_arm64.tar.gz`
+- `tele-auto-go-web_v1.0.0.tar.gz`
+
+### Manual Fallback
+
+If you want to build locally instead:
 
 ```bash
 make release-build VERSION=v1.0.0
@@ -24,9 +40,7 @@ This creates:
 - `release/tele-auto-go_v1.0.0_linux_arm64.tar.gz`
 - `release/tele-auto-go-web_v1.0.0.tar.gz`
 
-2. Upload these three files to your GitHub Release tag (`v1.0.0`).
-
-3. Install on Linux server in one command:
+Then install on Linux server in one command:
 
 ```bash
 REPO=thuhtetnaingdev/tele-auto-go VERSION=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/thuhtetnaingdev/tele-auto-go/main/deploy/install.sh)
