@@ -29,7 +29,9 @@ jobs:
           go-version-file: backend/go.mod
 
       - name: Build release artifacts
-        run: make release-build VERSION="${GITHUB_REF_NAME}"
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: ./scripts/release/build.sh
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
