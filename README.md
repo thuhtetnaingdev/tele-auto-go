@@ -54,8 +54,12 @@ After install, CLI commands are available:
 tele-auto status
 tele-auto logs
 tele-auto restart
+tele-auto upgrade
+tele-auto upgrade v1.0.1
 tele-auto uninstall
 ```
+
+`tele-auto upgrade` downloads the GitHub release assets and updates the install without replacing your existing `/opt/tele-auto-go/etc/tele-auto.env` values.
 
 `tele-auto uninstall` asks for confirmation. Type `y` to remove:
 - systemd service/unit

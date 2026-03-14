@@ -342,8 +342,12 @@ write_cli_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+APP_USER="${APP_USER}"
+APP_GROUP="${APP_GROUP}"
+REPO="${REPO}"
 SERVICE_NAME="${SERVICE_NAME}"
 INSTALL_DIR="${INSTALL_DIR}"
+INSTALLER_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/install.sh"
 
 run_as_root() {
   if [[ "\$(id -u)" -eq 0 ]]; then
@@ -358,6 +362,31 @@ run_as_root() {
   exit 1
 }
 
+run_upgrade() {
+  local version="\${1:-latest}" tmp
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Missing required command: curl"
+    exit 1
+  fi
+  tmp="\$(mktemp)"
+  trap 'rm -f "\${tmp}"' RETURN
+
+  echo "Fetching installer from \${INSTALLER_URL}"
+  curl -fsSL "\${INSTALLER_URL}" -o "\${tmp}"
+  echo "Upgrading tele-auto to release: \${version}"
+  echo "Existing env file will be kept at: \${INSTALL_DIR}/etc/tele-auto.env"
+
+  run_as_root env \
+    REPO="\${REPO}" \
+    VERSION="\${version}" \
+    INSTALL_DIR="\${INSTALL_DIR}" \
+    SERVICE_NAME="\${SERVICE_NAME}" \
+    APP_USER="\${APP_USER}" \
+    APP_GROUP="\${APP_GROUP}" \
+    GITHUB_TOKEN="\${GITHUB_TOKEN:-}" \
+    bash "\${tmp}"
+}
+
 usage() {
   cat <<EOF
 Usage: tele-auto <command>
@@ -368,6 +397,7 @@ Commands:
   stop         Stop service
   restart      Restart service
   logs         Tail service logs
+  upgrade      Upgrade from GitHub release assets (default: latest)
   uninstall    Uninstall tele-auto (asks for confirmation)
 EOF
 }
@@ -388,6 +418,10 @@ case "\${cmd}" in
     ;;
   logs)
     exec journalctl -u "\${SERVICE_NAME}" -f
+    ;;
+  upgrade)
+    shift || true
+    run_upgrade "\${1:-latest}"
     ;;
   uninstall)
     shift || true
@@ -430,8 +464,6 @@ main() {
   echo "    app: ${app_tar}"
   echo "    web: ${web_tar}"
 
-  stop_existing_runtime "$env_file"
-
   TMP_DIR="$(mktemp -d)"
 
   echo "==> Downloading artifacts"
@@ -440,6 +472,8 @@ main() {
 
   mkdir -p "${TMP_DIR}/app"
   tar -xzf "${TMP_DIR}/${app_tar}" -C "${TMP_DIR}/app"
+
+  stop_existing_runtime "$env_file"
 
   getent group "$APP_GROUP" >/dev/null 2>&1 || groupadd --system "$APP_GROUP"
   id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --gid "$APP_GROUP" --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$APP_USER"
@@ -478,6 +512,8 @@ SOUL_PROMPT_PATH=./SOUL.md
 ENV
     fi
     echo "==> Created $env_file (please edit required values)"
+  else
+    echo "==> Keeping existing env file: $env_file"
   fi
   ensure_admin_credentials "$env_file"
 
@@ -533,7 +569,7 @@ UNIT
   echo "1) Edit env: ${INSTALL_DIR}/etc/tele-auto.env"
   echo "2) Restart: systemctl restart ${SERVICE_NAME}"
   echo "3) Health: curl http://127.0.0.1:3000/health"
-  echo "4) CLI: tele-auto status | tele-auto uninstall"
+  echo "4) CLI: tele-auto status | tele-auto upgrade | tele-auto uninstall"
 }
 
 main "$@"
