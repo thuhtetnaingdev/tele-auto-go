@@ -15,6 +15,7 @@ import (
 
 	"tele-auto-go/internal/agents"
 	"tele-auto-go/internal/ai"
+	"tele-auto-go/internal/behavior"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/contextbuilder"
 	"tele-auto-go/internal/orchestrator"
@@ -36,6 +37,7 @@ type Service struct {
 	db         *store.Store
 	ai         *ai.Client
 	soulPrompt string
+	behavior   behavior.LoadedPolicy
 	orch       *orchestrator.Engine
 	onEvent    func(Event)
 
@@ -59,6 +61,7 @@ type Event struct {
 	Direction         string
 	Text              string
 	Mode              string
+	Reason            string
 	CreatedAt         string
 }
 
@@ -102,6 +105,7 @@ func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClien
 		db:             db,
 		ai:             aiClient,
 		soulPrompt:     soulPrompt,
+		behavior:       behavior.Load(cfg.BehaviorPath, logger),
 		orch:           orch,
 		onEvent:        onEvent,
 		debounceTimers: make(map[string]*debounceState),
@@ -328,11 +332,39 @@ func (s *Service) handleIncoming(ctx context.Context, entities tg.Entities, upd 
 			req.TriggerUserID = strconv.FormatInt(peerUser.UserID, 10)
 		}
 	}
-	if s.cfg.AutoReply.DebounceSeconds > 0 {
-		if !s.shouldAutoReply(ctx, chatID) {
-			return nil
+	decision := s.evaluateBehavior(ctx, chatID, latestIncomingText)
+	if !s.shouldAutoReply(ctx, chatID) {
+		if decision.ForceManual {
+			s.publishEvent(Event{
+				Type:      "behavior_escalated",
+				ChatID:    chatID,
+				Mode:      "manual",
+				Reason:    decision.SkipReason,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
 		}
-		s.scheduleDebouncedAutoReply(req)
+		return nil
+	}
+	if !decision.AllowReply {
+		if decision.ForceManual {
+			if err := s.db.SetBehaviorEscalation(ctx, chatID, decision.SkipReason); err != nil {
+				s.logger.Warn("failed to persist behavior escalation", "chat_id", chatID, "error", err.Error())
+			}
+			s.publishEvent(Event{
+				Type:      "behavior_escalated",
+				ChatID:    chatID,
+				Mode:      "manual",
+				Reason:    decision.SkipReason,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
+		}
+		if err := s.db.ClearBehaviorPending(ctx, chatID, time.Now().UTC()); err != nil {
+			s.logger.Warn("failed to clear behavior pending state", "chat_id", chatID, "error", err.Error())
+		}
+		return nil
+	}
+	if decision.DebounceSeconds > 0 {
+		s.scheduleDebouncedAutoReply(ctx, req, decision)
 		return nil
 	}
 	return s.executeAutoReply(ctx, req)
@@ -346,10 +378,14 @@ func truncatePreview(text string, max int) string {
 	return v[:max] + "...(truncated)"
 }
 
-func (s *Service) scheduleDebouncedAutoReply(req autoReplyRequest) {
-	window := time.Duration(s.cfg.AutoReply.DebounceSeconds) * time.Second
+func (s *Service) scheduleDebouncedAutoReply(ctx context.Context, req autoReplyRequest, decision behavior.Decision) {
+	window := time.Duration(decision.DebounceSeconds) * time.Second
 	if window <= 0 {
 		return
+	}
+
+	if err := s.db.UpdateBehaviorPending(ctx, req.ChatID, time.Now().UTC(), time.Now().UTC().Add(window), req.TriggerMessageID, truncatePreview(req.LatestIncoming, 120)); err != nil {
+		s.logger.Warn("failed to persist behavior debounce state", "chat_id", req.ChatID, "error", err.Error())
 	}
 
 	s.debounceMu.Lock()
@@ -373,7 +409,7 @@ func (s *Service) scheduleDebouncedAutoReply(req autoReplyRequest) {
 		"Auto-reply debounced",
 		"chat_id", req.ChatID,
 		"message_id", req.TriggerMessageID,
-		"debounce_seconds", s.cfg.AutoReply.DebounceSeconds,
+		"debounce_seconds", decision.DebounceSeconds,
 	)
 }
 
@@ -454,17 +490,41 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 		return fmt.Errorf("create auto reply row: %w", err)
 	}
 
+	decision := s.evaluateBehavior(ctx, req.ChatID, req.LatestIncoming)
 	if !s.shouldAutoReply(ctx, req.ChatID) {
+		_ = s.db.ClearBehaviorPending(ctx, req.ChatID, time.Now().UTC())
 		mode, ok, _ := s.db.GetChatMode(ctx, req.ChatID)
 		status := "skipped_disabled"
 		errMsg := "AUTO_REPLY_ENABLED=false"
-		if s.cfg.AutoReply.Enabled && ok && mode == "manual" {
+		if s.cfg.AutoReply.Enabled && decision.ForceManual {
+			status = "skipped_behavior_manual"
+			errMsg = decision.SkipReason
+		} else if s.cfg.AutoReply.Enabled && ok && mode == "manual" {
 			status = "skipped_manual_mode"
 			errMsg = "chat mode is manual"
 		}
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, status, errMsg)
 		return nil
 	}
+	if !decision.AllowReply {
+		_ = s.db.ClearBehaviorPending(ctx, req.ChatID, time.Now().UTC())
+		if decision.ForceManual {
+			if err := s.db.SetBehaviorEscalation(ctx, req.ChatID, decision.SkipReason); err != nil {
+				s.logger.Warn("failed to persist behavior escalation", "chat_id", req.ChatID, "error", err.Error())
+			}
+			s.publishEvent(Event{
+				Type:      "behavior_escalated",
+				ChatID:    req.ChatID,
+				Mode:      "manual",
+				Reason:    decision.SkipReason,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
+		}
+		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_behavior_policy", decision.SkipReason)
+		return nil
+	}
+
+	constraints := behavior.SampleConstraints(s.currentBehaviorPolicy())
 
 	reply := ""
 	replySource := "none"
@@ -477,7 +537,7 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 			TriggerMessage:  req.TriggerMessageID,
 			TriggerUserID:   req.TriggerUserID,
 			TriggerUsername: req.TriggerUsername,
-		}, s.soulPrompt)
+		}, s.soulPrompt, constraints)
 		if err != nil {
 			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
 		} else if strings.TrimSpace(reply) != "" {
@@ -498,16 +558,20 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 			toContextLines(history),
 			req.LatestIncoming,
 			s.soulPrompt,
+			constraints,
 		)
 		reply, err = s.ai.GenerateReply(ctx, systemPrompt, userPrompt)
 		if err != nil {
 			_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "ai_error", err.Error())
+			s.markBehaviorFailure(ctx, req.ChatID, "ai_error")
 			return fmt.Errorf("ai generate: %w", err)
 		}
 		replySource = "legacy_ai"
 	}
+	reply = behavior.ApplyOutputConstraints(reply, constraints, 40)
 	if strings.TrimSpace(reply) == "" {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "skipped_empty", "AI returned blank text")
+		s.markBehaviorFailure(ctx, req.ChatID, "skipped_empty")
 		s.logger.Info("No reply sent", "chat_id", req.ChatID, "message_id", req.TriggerMessageID, "reason", "blank_ai_output")
 		return nil
 	}
@@ -515,26 +579,34 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 	d, err := util.WaitRandomDelayContext(ctx, s.cfg.AutoReply.DelayMinMS, s.cfg.AutoReply.DelayMaxMS)
 	if err != nil {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "canceled_before_send", err.Error())
+		s.markBehaviorFailure(ctx, req.ChatID, "canceled_before_send")
 		return nil
 	}
 	s.logger.Debug("Human-like delay completed", "delay_ms", d.Milliseconds(), "chat_id", req.ChatID, "message_id", req.TriggerMessageID)
 
-	sentRecord, err := s.sendAndPersist(ctx, inputPeer, req.ChatID, "me", reply)
+	sentRecords, err := s.sendReplyParts(ctx, inputPeer, req.ChatID, "me", reply, constraints)
 	if err != nil {
 		_ = s.db.MarkAutoReplyFailed(ctx, autoReplyID, "send_failed", err.Error())
+		s.markBehaviorFailure(ctx, req.ChatID, "send_failed")
 		return fmt.Errorf("send reply: %w", err)
 	}
 	if err := s.db.MarkAutoReplySent(ctx, autoReplyID, reply); err != nil {
 		s.logger.Warn("failed to mark auto reply sent", "error", err.Error())
 	}
-	s.publishEvent(Event{
-		Type:              "message_created",
-		ChatID:            sentRecord.ChatID,
-		TelegramMessageID: sentRecord.TelegramMessageID,
-		Direction:         sentRecord.Direction,
-		Text:              sentRecord.Text,
-		CreatedAt:         sentRecord.CreatedAt.UTC().Format(time.RFC3339Nano),
-	})
+	lastSent := sentRecords[len(sentRecords)-1]
+	if err := s.db.MarkBehaviorReplySent(ctx, req.ChatID, lastSent.CreatedAt); err != nil {
+		s.logger.Warn("failed to persist behavior success state", "chat_id", req.ChatID, "error", err.Error())
+	}
+	for _, sentRecord := range sentRecords {
+		s.publishEvent(Event{
+			Type:              "message_created",
+			ChatID:            sentRecord.ChatID,
+			TelegramMessageID: sentRecord.TelegramMessageID,
+			Direction:         sentRecord.Direction,
+			Text:              sentRecord.Text,
+			CreatedAt:         sentRecord.CreatedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
 
 	s.logger.Info(
 		"Auto-reply sent",
@@ -554,8 +626,68 @@ func (s *Service) publishEvent(ev Event) {
 	s.onEvent(ev)
 }
 
+func (s *Service) currentBehaviorPolicy() behavior.Policy {
+	return s.behavior.Policy
+}
+
+func (s *Service) currentBehaviorMeta() behavior.LoadedPolicy {
+	return s.behavior
+}
+
+func (s *Service) behaviorState(ctx context.Context, chatID string) behavior.RuntimeState {
+	state, ok, err := s.db.GetBehaviorRuntimeState(ctx, chatID)
+	if err != nil {
+		s.logger.Warn("failed to load behavior runtime state", "chat_id", chatID, "error", err.Error())
+		return behavior.RuntimeState{ChatID: chatID}
+	}
+	if !ok {
+		return behavior.RuntimeState{ChatID: chatID}
+	}
+	return behavior.RuntimeState{
+		ChatID:                  state.ChatID,
+		LastIncomingAt:          state.LastIncomingAt,
+		LastAutoReplyAt:         state.LastAutoReplyAt,
+		DebounceUntil:           state.DebounceUntil,
+		PendingTriggerMessageID: state.PendingTriggerMessageID,
+		PendingPreview:          state.PendingPreview,
+		ConsecutiveFailures:     state.ConsecutiveFailures,
+		EscalatedManual:         state.EscalatedManual,
+		EscalationReason:        state.EscalationReason,
+		UpdatedAt:               state.UpdatedAt,
+	}
+}
+
+func (s *Service) evaluateBehavior(ctx context.Context, chatID, latestIncoming string) behavior.Decision {
+	return behavior.Evaluate(time.Now(), s.currentBehaviorPolicy(), s.behaviorState(ctx, chatID), latestIncoming)
+}
+
+func (s *Service) markBehaviorFailure(ctx context.Context, chatID, reason string) {
+	policy := s.currentBehaviorPolicy()
+	current := s.behaviorState(ctx, chatID)
+	nextFailures := current.ConsecutiveFailures + 1
+	escalate := behavior.ShouldEscalateAfterFailure(policy, nextFailures)
+	state, err := s.db.MarkBehaviorFailure(ctx, chatID, reason, escalate)
+	if err != nil {
+		s.logger.Warn("failed to persist behavior failure", "chat_id", chatID, "error", err.Error())
+		return
+	}
+	if state.EscalatedManual {
+		s.publishEvent(Event{
+			Type:      "behavior_escalated",
+			ChatID:    chatID,
+			Mode:      "manual",
+			Reason:    state.EscalationReason,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+	}
+}
+
 func (s *Service) shouldAutoReply(ctx context.Context, chatID string) bool {
 	if !s.cfg.AutoReply.Enabled {
+		return false
+	}
+	state := s.behaviorState(ctx, chatID)
+	if state.EscalatedManual {
 		return false
 	}
 	mode, ok, err := s.db.GetChatMode(ctx, chatID)
@@ -727,6 +859,32 @@ func (s *Service) sendAndPersist(ctx context.Context, inputPeer tg.InputPeerClas
 		return store.MessageRecord{}, err
 	}
 	return row, nil
+}
+
+func (s *Service) sendReplyParts(ctx context.Context, inputPeer tg.InputPeerClass, chatID, senderName, text string, constraints behavior.Constraints) ([]store.MessageRecord, error) {
+	parts := []string{text}
+	if constraints.PreferSplitMessages && !constraints.PreferOneWordReply {
+		if split := behavior.SplitOutgoingMessages(text); len(split) > 0 {
+			parts = split
+		}
+	}
+
+	records := make([]store.MessageRecord, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		rec, err := s.sendAndPersist(ctx, inputPeer, chatID, senderName, part)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no reply parts to send")
+	}
+	return records, nil
 }
 
 func (s *Service) normalizeHistory(messages []tg.MessageClass) []historyEntry {

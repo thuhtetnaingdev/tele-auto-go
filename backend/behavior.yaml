@@ -1,0 +1,21 @@
+debounceSeconds: 10
+cooldownSeconds: 0
+quietHours: []
+maxReplyWords: 60
+shortReplyProbability: 0.2
+oneWordReplyProbability: 0.2
+followUpProbability: 1
+splitMessageProbability: 0.2
+toneRules:
+  allow:
+  - natural
+  - brief
+  - human
+  deny:
+  - assistant-like
+  - promotional
+  - flirty
+escalation:
+  failureThreshold: 3
+  triggerKeywords:
+  - refund

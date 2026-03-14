@@ -86,3 +86,42 @@ func TestConversationQueries(t *testing.T) {
 		t.Fatalf("unexpected message order: %#v", msgs)
 	}
 }
+
+func TestBehaviorRuntimeEscalationLifecycle(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 3, 14, 12, 0, 0, 0, time.UTC)
+
+	if err := s.UpdateBehaviorPending(ctx, "user:42", now, now.Add(10*time.Second), "99", "hello there"); err != nil {
+		t.Fatalf("update behavior pending: %v", err)
+	}
+	pending, ok, err := s.GetBehaviorRuntimeState(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("get behavior runtime state: %v", err)
+	}
+	if !ok || pending.PendingTriggerMessageID != "99" {
+		t.Fatalf("unexpected pending state: %#v ok=%v", pending, ok)
+	}
+
+	failed, err := s.MarkBehaviorFailure(ctx, "user:42", "ai_error", true)
+	if err != nil {
+		t.Fatalf("mark behavior failure: %v", err)
+	}
+	if failed.ConsecutiveFailures != 1 || !failed.EscalatedManual {
+		t.Fatalf("unexpected failed state: %#v", failed)
+	}
+	if !failed.DebounceUntil.IsZero() || failed.PendingTriggerMessageID != "" {
+		t.Fatalf("expected pending debounce state to clear on failure: %#v", failed)
+	}
+
+	if err := s.ClearBehaviorEscalation(ctx, "user:42"); err != nil {
+		t.Fatalf("clear behavior escalation: %v", err)
+	}
+	cleared, ok, err := s.GetBehaviorRuntimeState(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("reload behavior state: %v", err)
+	}
+	if !ok || cleared.EscalatedManual || cleared.ConsecutiveFailures != 0 {
+		t.Fatalf("unexpected cleared state: %#v", cleared)
+	}
+}

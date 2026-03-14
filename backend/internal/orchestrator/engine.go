@@ -16,6 +16,7 @@ import (
 
 	"tele-auto-go/internal/agents"
 	"tele-auto-go/internal/ai"
+	"tele-auto-go/internal/behavior"
 	"tele-auto-go/internal/contextbuilder"
 	"tele-auto-go/internal/store"
 	"tele-auto-go/internal/util"
@@ -57,7 +58,7 @@ func New(aiClient *ai.Client, agentManager *agents.Manager, st *store.Store, log
 	}
 }
 
-func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt string) (string, error) {
+func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt string, constraints behavior.Constraints) (string, error) {
 	started := time.Now()
 	run := store.OrchestrationRun{
 		ChatID:         mc.ChatID,
@@ -139,7 +140,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		"agent_body_preview", truncateText(agentInstructions, 260),
 	)
 
-	decision, err := e.decideToolCall(ctx, agent, agentInstructions, mc, soulPrompt)
+	decision, err := e.decideToolCall(ctx, agent, agentInstructions, mc, soulPrompt, constraints)
 	if err != nil {
 		run.ErrorMessage = "tool decide: " + err.Error()
 		return e.fail(mc, run, started, "decide_tool_call", "Sorry, failed to process request.")
@@ -171,7 +172,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		}
 	}
 
-	finalReply, err := e.synthesize(ctx, agent, agentInstructions, mc, decision, toolResp, soulPrompt, types)
+	finalReply, err := e.synthesize(ctx, agent, agentInstructions, mc, decision, toolResp, soulPrompt, constraints, types)
 	if err != nil {
 		run.ErrorMessage = "synthesize: " + err.Error()
 		return e.fail(mc, run, started, "synthesize_reply", "Sorry, failed to compose final response.")
@@ -192,7 +193,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		"status", run.Status,
 		"duration_ms", time.Since(started).Milliseconds(),
 	)
-	return util.ClampWords(finalReply, 80), nil
+	return behavior.ApplyOutputConstraints(finalReply, constraints, 80), nil
 }
 
 type toolDecision struct {
@@ -311,7 +312,7 @@ func (e *Engine) routeAgent(ctx context.Context, mc MessageContext, agentsList [
 	return RouterResult{}, fmt.Errorf("router selected unknown agent: %s", parsed.AgentID)
 }
 
-func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentInstructions string, mc MessageContext, soulPrompt string) (toolDecision, error) {
+func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentInstructions string, mc MessageContext, soulPrompt string, constraints behavior.Constraints) (toolDecision, error) {
 	history := make([]string, 0, len(mc.RecentMessages))
 	for i, line := range mc.RecentMessages {
 		history = append(history, fmt.Sprintf("%d. [%s] %s", i+1, line.Direction, line.Text))
@@ -329,6 +330,9 @@ func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentIn
 	userPrompt := strings.Join([]string{
 		"Agent profile:",
 		agentInstructions,
+		"",
+		"Behavior constraints:",
+		behavior.BuildInstructionText(constraints),
 		"",
 		"SOUL prompt:",
 		soulPrompt,
@@ -397,6 +401,7 @@ func (e *Engine) synthesize(
 	decision toolDecision,
 	toolResp apiToolResponse,
 	soulPrompt string,
+	constraints behavior.Constraints,
 	varTypes map[string]string,
 ) (string, error) {
 	if !decision.CallTool {
@@ -411,12 +416,16 @@ func (e *Engine) synthesize(
 	systemPrompt := strings.Join([]string{
 		"You are a Telegram reply composer.",
 		"Return only final human message text in same language as user.",
+		"If behavior constraints request message splitting, you may return up to two short Telegram messages separated by a blank line.",
 		"No markdown, no JSON, no labels.",
 	}, "\n")
 
 	userPrompt := strings.Join([]string{
 		"Agent profile:",
 		agentInstructions,
+		"",
+		"Behavior constraints:",
+		behavior.BuildInstructionText(constraints),
 		"",
 		"SOUL:",
 		soulPrompt,

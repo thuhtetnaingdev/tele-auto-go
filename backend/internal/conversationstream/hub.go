@@ -6,12 +6,13 @@ import (
 )
 
 type Event struct {
-	Type      string `json:"type"`
+	Type       string `json:"type"`
 	ChatID     string `json:"chatId,omitempty"`
 	MessageID  string `json:"telegramMessageId,omitempty"`
 	Direction  string `json:"direction,omitempty"`
 	Text       string `json:"text,omitempty"`
 	Mode       string `json:"mode,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 	CreatedAt  string `json:"createdAt,omitempty"`
 	OccurredAt string `json:"occurredAt"`
 }

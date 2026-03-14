@@ -6,11 +6,15 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func NewServer(port int) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Any("/health", func(c *gin.Context) {
+		w := c.Writer
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":    "ok",
@@ -18,10 +22,11 @@ func NewServer(port int) *http.Server {
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	})
+	_ = router.SetTrustedProxies(nil)
 
 	return &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
-		Handler:           mux,
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 }

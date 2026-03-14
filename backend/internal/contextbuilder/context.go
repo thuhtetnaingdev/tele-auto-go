@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"tele-auto-go/internal/behavior"
 	"tele-auto-go/internal/util"
 )
 
@@ -13,14 +14,14 @@ type MessageLine struct {
 }
 
 const baseSystemPrompt = "You are replying as a real human Telegram user. " +
-	"Write exactly one short natural reply in plain text. " +
+	"Write one short natural Telegram reply in plain text, or at most two short messages if behavior constraints explicitly request a split reply. " +
 	"Match the language and tone of the latest incoming message and recent conversation. " +
 	"Stay conservative and natural: not flirty, not promotional, not assistant-like. " +
 	"Keep it brief, ideally under 40 words unless context strongly requires more. " +
 	"No markdown, no labels, no explanation, no quotes. " +
 	"Do not mention being AI. Return only the final reply text."
 
-func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPrompt string) (systemPrompt, userPrompt string) {
+func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPrompt string, constraints behavior.Constraints) (systemPrompt, userPrompt string) {
 	if strings.TrimSpace(chatWith) == "" {
 		chatWith = "unknown"
 	}
@@ -42,6 +43,8 @@ func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPro
 		"",
 		"Latest incoming message:",
 		safeText(latestIncoming),
+		"",
+		buildBehaviorPrompt(constraints),
 		"",
 		"Instruction:",
 		"Write one short natural reply for Telegram in the same language and tone as the conversation.",
@@ -68,4 +71,12 @@ func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPro
 
 func safeText(s string) string {
 	return util.NormalizeSpace(s)
+}
+
+func buildBehaviorPrompt(constraints behavior.Constraints) string {
+	text := strings.TrimSpace(behavior.BuildInstructionText(constraints))
+	if text == "" {
+		return "Behavior constraints: keep the reply natural and concise."
+	}
+	return "Behavior constraints:\n" + text
 }

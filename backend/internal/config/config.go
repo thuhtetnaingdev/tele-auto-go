@@ -14,6 +14,7 @@ type Config struct {
 	LogLevel       string
 	SQLitePath     string
 	SoulPromptPath string
+	BehaviorPath   string
 	AgentsDir      string
 	ContextLimit   int
 
@@ -64,6 +65,7 @@ func LoadForApp() (Config, error) {
 		LogLevel:       getString("LOG_LEVEL", "info"),
 		SQLitePath:     getString("SQLITE_PATH", "./data/app.db"),
 		SoulPromptPath: getString("SOUL_PROMPT_PATH", "./SOUL.md"),
+		BehaviorPath:   getString("BEHAVIOR_POLICY_PATH", "./behavior.yaml"),
 		AgentsDir:      getString("AGENTS_DIR", "./agents"),
 		ContextLimit:   getPositiveInt("AI_CONTEXT_MESSAGE_LIMIT", fixedContextLimit),
 	}

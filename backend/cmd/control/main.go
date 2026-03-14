@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -25,6 +26,7 @@ import (
 
 	"tele-auto-go/internal/adminauth"
 	"tele-auto-go/internal/agents"
+	"tele-auto-go/internal/behavior"
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/control"
 	"tele-auto-go/internal/conversationstream"
@@ -75,6 +77,7 @@ func main() {
 			Direction: ev.Direction,
 			Text:      ev.Text,
 			Mode:      ev.Mode,
+			Reason:    ev.Reason,
 			CreatedAt: ev.CreatedAt,
 		})
 	})
@@ -140,36 +143,61 @@ func main() {
 	}
 
 	port := readServerPort()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", server.handleHealth)
-	mux.HandleFunc("/api/admin/me", server.handleAdminMe)
-	mux.HandleFunc("/api/admin/login", server.handleAdminLogin)
-	mux.HandleFunc("/api/admin/logout", server.handleAdminLogout)
-	mux.HandleFunc("/api/admin/credentials", server.requireAdmin(server.handleAdminCredentials))
-	mux.HandleFunc("/api/auth/status", server.requireAdmin(server.handleAuthStatus))
-	mux.HandleFunc("/api/auth/login", server.requireAdmin(server.handleLogin))
-	mux.HandleFunc("/api/auth/logout", server.requireAdmin(server.handleLogout))
-	mux.HandleFunc("/api/service/status", server.requireAdmin(server.handleServiceStatus))
-	mux.HandleFunc("/api/service/start", server.requireAdmin(server.handleServiceStart))
-	mux.HandleFunc("/api/service/stop", server.requireAdmin(server.handleServiceStop))
-	mux.HandleFunc("/api/service/restart", server.requireAdmin(server.handleServiceRestart))
-	mux.HandleFunc("/api/settings", server.requireAdmin(server.handleSettings))
-	mux.HandleFunc("/api/variables", server.requireAdmin(server.handleVariables))
-	mux.HandleFunc("/api/variables/", server.requireAdmin(server.handleVariableByKey))
-	mux.HandleFunc("/api/agents", server.requireAdmin(server.handleAgents))
-	mux.HandleFunc("/api/agents/", server.requireAdmin(server.handleAgentByID))
-	mux.HandleFunc("/api/conversations/stream", server.requireAdmin(server.handleConversationStream))
-	mux.HandleFunc("/api/conversations/", server.requireAdmin(server.handleConversationByID))
-	mux.HandleFunc("/api/conversations", server.requireAdmin(server.handleConversations))
-	mux.HandleFunc("/api/soul", server.requireAdmin(server.handleSoul))
-	mux.HandleFunc("/api/logs", server.requireAdmin(server.handleLogs))
-	mux.HandleFunc("/api/logs/stream", server.requireAdmin(server.handleLogStream))
-	mux.HandleFunc("/", server.handleFrontend)
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.HandleMethodNotAllowed = true
+	router.Use(gin.Recovery())
+	router.Use(corsMiddleware(server.frontendBase))
+	_ = router.SetTrustedProxies(nil)
 
-	root := withCORS(server.frontendBase, mux)
+	router.GET("/health", gin.WrapF(server.handleHealth))
+	router.GET("/api/admin/me", gin.WrapF(server.handleAdminMe))
+	router.POST("/api/admin/login", gin.WrapF(server.handleAdminLogin))
+	router.POST("/api/admin/logout", gin.WrapF(server.handleAdminLogout))
+
+	protected := router.Group("/api")
+	protected.Use(server.requireAdminGin())
+	{
+		protected.PUT("/admin/credentials", gin.WrapF(server.handleAdminCredentials))
+		protected.GET("/auth/status", gin.WrapF(server.handleAuthStatus))
+		protected.POST("/auth/login", gin.WrapF(server.handleLogin))
+		protected.POST("/auth/logout", gin.WrapF(server.handleLogout))
+		protected.GET("/service/status", gin.WrapF(server.handleServiceStatus))
+		protected.POST("/service/start", gin.WrapF(server.handleServiceStart))
+		protected.POST("/service/stop", gin.WrapF(server.handleServiceStop))
+		protected.POST("/service/restart", gin.WrapF(server.handleServiceRestart))
+		protected.GET("/settings", gin.WrapF(server.handleSettings))
+		protected.PUT("/settings", gin.WrapF(server.handleSettings))
+		protected.GET("/variables", gin.WrapF(server.handleVariables))
+		protected.PUT("/variables", gin.WrapF(server.handleVariables))
+		protected.DELETE("/variables/:key", gin.WrapF(server.handleVariableByKey))
+		protected.GET("/agents", gin.WrapF(server.handleAgents))
+		protected.POST("/agents", gin.WrapF(server.handleAgents))
+		protected.GET("/agents/:id", gin.WrapF(server.handleAgentByID))
+		protected.PUT("/agents/:id", gin.WrapF(server.handleAgentByID))
+		protected.DELETE("/agents/:id", gin.WrapF(server.handleAgentByID))
+		protected.GET("/conversations/stream", gin.WrapF(server.handleConversationStream))
+		protected.GET("/conversations", gin.WrapF(server.handleConversations))
+		protected.GET("/conversations/:chatID/:action", gin.WrapF(server.handleConversationByID))
+		protected.POST("/conversations/:chatID/:action", gin.WrapF(server.handleConversationByID))
+		protected.PUT("/conversations/:chatID/:action", gin.WrapF(server.handleConversationByID))
+		protected.GET("/behavior", gin.WrapF(server.handleBehavior))
+		protected.PUT("/behavior", gin.WrapF(server.handleBehavior))
+		protected.GET("/behavior/runtime", gin.WrapF(server.handleBehaviorRuntime))
+		protected.GET("/soul", gin.WrapF(server.handleSoul))
+		protected.PUT("/soul", gin.WrapF(server.handleSoul))
+		protected.GET("/logs", gin.WrapF(server.handleLogs))
+		protected.GET("/logs/stream", gin.WrapF(server.handleLogStream))
+	}
+
+	router.NoMethod(func(c *gin.Context) {
+		methodNotAllowed(c.Writer)
+	})
+	router.NoRoute(gin.WrapF(server.handleFrontend))
+
 	httpServer := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
-		Handler:           root,
+		Handler:           router,
 		ReadHeaderTimeout: 8 * time.Second,
 	}
 
@@ -608,7 +636,6 @@ var allowedSettingKeys = []string{
 	"OPENAI_API_KEY",
 	"OPENAI_MODEL",
 	"AI_CONTEXT_MESSAGE_LIMIT",
-	"AUTO_REPLY_DEBOUNCE_SECONDS",
 	"AUTO_REPLY_ENABLED",
 }
 
@@ -925,6 +952,79 @@ type sendConversationMessageRequest struct {
 	Text string `json:"text"`
 }
 
+type updateBehaviorPolicyRequest = behavior.Policy
+
+func readBehaviorPathFromEnv() string {
+	path := strings.TrimSpace(os.Getenv("BEHAVIOR_POLICY_PATH"))
+	if path == "" {
+		path = "./behavior.yaml"
+	}
+	return filepath.Clean(path)
+}
+
+func (s *apiServer) handleBehavior(w http.ResponseWriter, r *http.Request) {
+	path := readBehaviorPathFromEnv()
+
+	switch r.Method {
+	case http.MethodGet:
+		loaded := behavior.Load(path, s.logger)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"path":     loaded.Path,
+			"loadedAt": loaded.LoadedAt.Format(time.RFC3339Nano),
+			"policy":   loaded.Policy,
+		})
+	case http.MethodPut:
+		var req updateBehaviorPolicyRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		loaded, err := behavior.Write(path, req)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		restarted := false
+		if s.manager.Status().Running {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			if err := s.manager.Restart(ctx); err != nil {
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+			restarted = true
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":        true,
+			"restarted": restarted,
+			"path":      loaded.Path,
+			"loadedAt":  loaded.LoadedAt.Format(time.RFC3339Nano),
+			"policy":    loaded.Policy,
+		})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handleBehaviorRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	states, err := s.db.ListBehaviorRuntimeStates(r.Context(), 500)
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+		return
+	}
+	loaded := behavior.Load(readBehaviorPathFromEnv(), s.logger)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":     loaded.Path,
+		"loadedAt": loaded.LoadedAt.Format(time.RFC3339Nano),
+		"policy":   loaded.Policy,
+		"states":   states,
+	})
+}
+
 func (s *apiServer) handleConversations(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -944,6 +1044,15 @@ func (s *apiServer) handleConversations(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			errorJSON(w, http.StatusInternalServerError, err)
 			return
+		}
+		runtimeStates, err := s.db.ListBehaviorRuntimeStates(r.Context(), 1000)
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		runtimeByChat := make(map[string]store.BehaviorRuntimeState, len(runtimeStates))
+		for _, state := range runtimeStates {
+			runtimeByChat[state.ChatID] = state
 		}
 		unresolved := make([]string, 0)
 		for _, row := range rows {
@@ -967,7 +1076,8 @@ func (s *apiServer) handleConversations(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 			mode, hasMode := modes[row.ChatID]
-			effective := effectiveConversationMode(globalEnabled, mode, hasMode)
+			runtime := runtimeByChat[row.ChatID]
+			effective := effectiveConversationMode(globalEnabled, mode, hasMode, runtime.EscalatedManual)
 			hasManual := hasMode && mode == "manual"
 			items = append(items, map[string]any{
 				"chatId":            row.ChatID,
@@ -978,6 +1088,8 @@ func (s *apiServer) handleConversations(w http.ResponseWriter, r *http.Request) 
 				"effectiveMode":     effective,
 				"hasManualOverride": hasManual,
 				"mode":              mode,
+				"escalatedManual":   runtime.EscalatedManual,
+				"manualReason":      strings.TrimSpace(runtime.EscalationReason),
 			})
 		}
 
@@ -1117,12 +1229,20 @@ func (s *apiServer) handleConversationMode(w http.ResponseWriter, r *http.Reques
 		errorJSON(w, http.StatusBadRequest, err)
 		return
 	}
+	if mode == "auto" {
+		if err := s.db.ClearBehaviorEscalation(r.Context(), chatID); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+	}
 	globalEnabled := readBoolEnv("AUTO_REPLY_ENABLED", true)
-	effective := effectiveConversationMode(globalEnabled, mode, true)
+	runtimeState, _, _ := s.db.GetBehaviorRuntimeState(r.Context(), chatID)
+	effective := effectiveConversationMode(globalEnabled, mode, true, runtimeState.EscalatedManual)
 	s.convEvents.Publish(conversationstream.Event{
 		Type:      "mode_changed",
 		ChatID:    chatID,
 		Mode:      mode,
+		Reason:    strings.TrimSpace(runtimeState.EscalationReason),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1131,6 +1251,8 @@ func (s *apiServer) handleConversationMode(w http.ResponseWriter, r *http.Reques
 		"mode":              mode,
 		"effectiveMode":     effective,
 		"globalAutoEnabled": globalEnabled,
+		"escalatedManual":   runtimeState.EscalatedManual,
+		"manualReason":      strings.TrimSpace(runtimeState.EscalationReason),
 	})
 }
 
@@ -1308,13 +1430,13 @@ func (s *apiServer) handleConversationStream(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-func (s *apiServer) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.isAdminAuthenticated(r) {
-			next(w, r)
+func (s *apiServer) requireAdminGin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.isAdminAuthenticated(c.Request) {
+			c.Next()
 			return
 		}
-		errorJSON(w, http.StatusUnauthorized, errors.New("unauthorized"))
+		c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 }
 
@@ -1367,22 +1489,22 @@ func writeSSE(w http.ResponseWriter, event string, payload any) error {
 	return nil
 }
 
-func withCORS(frontendBase string, next http.Handler) http.Handler {
+func corsMiddleware(frontendBase string) gin.HandlerFunc {
 	allowedOrigin := "http://localhost:5173"
 	if frontendBase != "" {
 		allowedOrigin = frontendBase
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", allowedOrigin)
+		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		c.Header("Access-Control-Allow-Credentials", "true")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
 func readServerPort() int {
@@ -1406,8 +1528,11 @@ func readWebDir() string {
 	return "./web"
 }
 
-func effectiveConversationMode(globalEnabled bool, mode string, hasMode bool) string {
+func effectiveConversationMode(globalEnabled bool, mode string, hasMode bool, escalatedManual bool) string {
 	if !globalEnabled {
+		return "manual"
+	}
+	if escalatedManual {
 		return "manual"
 	}
 	if hasMode && strings.TrimSpace(strings.ToLower(mode)) == "manual" {

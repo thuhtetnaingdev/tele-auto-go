@@ -41,6 +41,19 @@ type ConversationMessage struct {
 	CreatedAt         string `json:"createdAt"`
 }
 
+type BehaviorRuntimeState struct {
+	ChatID                  string    `json:"chatId"`
+	LastIncomingAt          time.Time `json:"lastIncomingAt,omitempty"`
+	LastAutoReplyAt         time.Time `json:"lastReplyAt,omitempty"`
+	DebounceUntil           time.Time `json:"debounceUntil,omitempty"`
+	PendingTriggerMessageID string    `json:"pendingTriggerMessageId,omitempty"`
+	PendingPreview          string    `json:"pendingPreview,omitempty"`
+	ConsecutiveFailures     int       `json:"failureCount"`
+	EscalatedManual         bool      `json:"escalatedManual"`
+	EscalationReason        string    `json:"reason,omitempty"`
+	UpdatedAt               time.Time `json:"updatedAt,omitempty"`
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -145,6 +158,19 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
   final_reply TEXT,
   duration_ms INTEGER NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS behavior_runtime_states (
+  chat_id TEXT PRIMARY KEY,
+  last_incoming_at TEXT,
+  last_auto_reply_at TEXT,
+  debounce_until TEXT,
+  pending_trigger_message_id TEXT,
+  pending_preview TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  escalated_manual INTEGER NOT NULL DEFAULT 0,
+  escalation_reason TEXT,
+  updated_at TEXT NOT NULL
 );
 `); err != nil {
 		_ = db.Close()
@@ -564,6 +590,214 @@ WHERE chat_id = ?
 	return err
 }
 
+func (s *Store) GetBehaviorRuntimeState(ctx context.Context, chatID string) (BehaviorRuntimeState, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return BehaviorRuntimeState{}, false, fmt.Errorf("chat_id is required")
+	}
+
+	row := s.db.QueryRowContext(ctx, `
+SELECT
+  chat_id,
+  last_incoming_at,
+  last_auto_reply_at,
+  debounce_until,
+  pending_trigger_message_id,
+  pending_preview,
+  consecutive_failures,
+  escalated_manual,
+  escalation_reason,
+  updated_at
+FROM behavior_runtime_states
+WHERE chat_id = ?
+`, chatID)
+
+	state, ok, err := scanBehaviorRuntimeState(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BehaviorRuntimeState{}, false, nil
+	}
+	if err != nil {
+		return BehaviorRuntimeState{}, false, err
+	}
+	return state, ok, nil
+}
+
+func (s *Store) ListBehaviorRuntimeStates(ctx context.Context, limit int) ([]BehaviorRuntimeState, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT
+  chat_id,
+  last_incoming_at,
+  last_auto_reply_at,
+  debounce_until,
+  pending_trigger_message_id,
+  pending_preview,
+  consecutive_failures,
+  escalated_manual,
+  escalation_reason,
+  updated_at
+FROM behavior_runtime_states
+ORDER BY updated_at DESC
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]BehaviorRuntimeState, 0, limit)
+	for rows.Next() {
+		state, _, err := scanBehaviorRuntimeState(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) UpdateBehaviorPending(ctx context.Context, chatID string, lastIncomingAt, debounceUntil time.Time, triggerMessageID, preview string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(
+  chat_id, last_incoming_at, debounce_until, pending_trigger_message_id, pending_preview,
+  consecutive_failures, escalated_manual, escalation_reason, updated_at
+) VALUES(?,?,?,?,?,0,0,NULL,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  last_incoming_at=excluded.last_incoming_at,
+  debounce_until=excluded.debounce_until,
+  pending_trigger_message_id=excluded.pending_trigger_message_id,
+  pending_preview=excluded.pending_preview,
+  updated_at=excluded.updated_at
+`, chatID, optionalRFC3339(lastIncomingAt), optionalRFC3339(debounceUntil), strings.TrimSpace(triggerMessageID), strings.TrimSpace(preview), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) ClearBehaviorPending(ctx context.Context, chatID string, lastIncomingAt time.Time) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(
+  chat_id, last_incoming_at, debounce_until, pending_trigger_message_id, pending_preview,
+  consecutive_failures, escalated_manual, escalation_reason, updated_at
+) VALUES(?,?,NULL,NULL,NULL,0,0,NULL,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  last_incoming_at=excluded.last_incoming_at,
+  debounce_until=NULL,
+  pending_trigger_message_id=NULL,
+  pending_preview=NULL,
+  updated_at=excluded.updated_at
+`, chatID, optionalRFC3339(lastIncomingAt), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) MarkBehaviorReplySent(ctx context.Context, chatID string, sentAt time.Time) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(
+  chat_id, last_auto_reply_at, debounce_until, pending_trigger_message_id, pending_preview,
+  consecutive_failures, escalated_manual, escalation_reason, updated_at
+) VALUES(?,?,NULL,NULL,NULL,0,0,NULL,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  last_auto_reply_at=excluded.last_auto_reply_at,
+  debounce_until=NULL,
+  pending_trigger_message_id=NULL,
+  pending_preview=NULL,
+  consecutive_failures=0,
+  updated_at=excluded.updated_at
+`, chatID, optionalRFC3339(sentAt), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) MarkBehaviorFailure(ctx context.Context, chatID, reason string, escalate bool) (BehaviorRuntimeState, error) {
+	state, _, err := s.GetBehaviorRuntimeState(ctx, chatID)
+	if err != nil {
+		return BehaviorRuntimeState{}, err
+	}
+	state.ChatID = strings.TrimSpace(chatID)
+	state.ConsecutiveFailures++
+	state.DebounceUntil = time.Time{}
+	state.PendingTriggerMessageID = ""
+	state.PendingPreview = ""
+	state.EscalationReason = strings.TrimSpace(reason)
+	if escalate {
+		state.EscalatedManual = true
+	}
+	state.UpdatedAt = time.Now().UTC()
+
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(
+  chat_id, last_incoming_at, last_auto_reply_at, debounce_until, pending_trigger_message_id, pending_preview,
+  consecutive_failures, escalated_manual, escalation_reason, updated_at
+) VALUES(?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  last_incoming_at=excluded.last_incoming_at,
+  last_auto_reply_at=excluded.last_auto_reply_at,
+  debounce_until=excluded.debounce_until,
+  pending_trigger_message_id=excluded.pending_trigger_message_id,
+  pending_preview=excluded.pending_preview,
+  consecutive_failures=excluded.consecutive_failures,
+  escalated_manual=excluded.escalated_manual,
+  escalation_reason=excluded.escalation_reason,
+  updated_at=excluded.updated_at
+`, state.ChatID, optionalRFC3339(state.LastIncomingAt), optionalRFC3339(state.LastAutoReplyAt), optionalRFC3339(state.DebounceUntil), nullableString(state.PendingTriggerMessageID), nullableString(state.PendingPreview), state.ConsecutiveFailures, boolToInt(state.EscalatedManual), nullableString(state.EscalationReason), state.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return BehaviorRuntimeState{}, err
+	}
+	return state, nil
+}
+
+func (s *Store) SetBehaviorEscalation(ctx context.Context, chatID, reason string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(chat_id, escalated_manual, escalation_reason, updated_at)
+VALUES(?,?,?,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  escalated_manual=excluded.escalated_manual,
+  escalation_reason=excluded.escalation_reason,
+  updated_at=excluded.updated_at
+`, chatID, 1, nullableString(reason), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) ClearBehaviorEscalation(ctx context.Context, chatID string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO behavior_runtime_states(chat_id, escalated_manual, escalation_reason, consecutive_failures, updated_at)
+VALUES(?,?,?,0,?)
+ON CONFLICT(chat_id) DO UPDATE SET
+  escalated_manual=0,
+  escalation_reason=NULL,
+  consecutive_failures=0,
+  updated_at=excluded.updated_at
+`, chatID, 0, nil, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
 func (s *Store) CreateAutoReply(
 	ctx context.Context,
 	chatID string,
@@ -618,4 +852,75 @@ func isUniqueErr(err error) bool {
 	return err != nil &&
 		(strings.Contains(err.Error(), "UNIQUE constraint failed") ||
 			strings.Contains(err.Error(), "constraint failed"))
+}
+
+func scanBehaviorRuntimeState(scan func(dest ...any) error) (BehaviorRuntimeState, bool, error) {
+	var (
+		state                      BehaviorRuntimeState
+		lastIncomingAtRaw          sql.NullString
+		lastAutoReplyAtRaw         sql.NullString
+		debounceUntilRaw           sql.NullString
+		pendingTriggerMessageIDRaw sql.NullString
+		pendingPreviewRaw          sql.NullString
+		escalatedManual            int
+		escalationReasonRaw        sql.NullString
+		updatedAtRaw               sql.NullString
+	)
+	if err := scan(
+		&state.ChatID,
+		&lastIncomingAtRaw,
+		&lastAutoReplyAtRaw,
+		&debounceUntilRaw,
+		&pendingTriggerMessageIDRaw,
+		&pendingPreviewRaw,
+		&state.ConsecutiveFailures,
+		&escalatedManual,
+		&escalationReasonRaw,
+		&updatedAtRaw,
+	); err != nil {
+		return BehaviorRuntimeState{}, false, err
+	}
+	state.LastIncomingAt = parseOptionalTime(lastIncomingAtRaw.String)
+	state.LastAutoReplyAt = parseOptionalTime(lastAutoReplyAtRaw.String)
+	state.DebounceUntil = parseOptionalTime(debounceUntilRaw.String)
+	state.PendingTriggerMessageID = strings.TrimSpace(pendingTriggerMessageIDRaw.String)
+	state.PendingPreview = strings.TrimSpace(pendingPreviewRaw.String)
+	state.EscalatedManual = escalatedManual == 1
+	state.EscalationReason = strings.TrimSpace(escalationReasonRaw.String)
+	state.UpdatedAt = parseOptionalTime(updatedAtRaw.String)
+	return state, true, nil
+}
+
+func parseOptionalTime(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+func optionalRFC3339(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func nullableString(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
