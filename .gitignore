@@ -10,3 +10,6 @@ frontend/dist/
 frontend/.env
 
 release/
+!scripts/
+!scripts/release/
+!scripts/release/build.sh
