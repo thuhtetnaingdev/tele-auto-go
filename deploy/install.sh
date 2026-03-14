@@ -166,6 +166,32 @@ set_env_value() {
   fi
 }
 
+migrate_legacy_env_file() {
+  local env_file="$1"
+  local legacy_file="$2"
+  local key current value migrated
+
+  if [[ ! -f "$legacy_file" ]]; then
+    return 0
+  fi
+
+  migrated=0
+  while IFS= read -r key; do
+    key="$(printf '%s' "$key" | xargs)"
+    [[ -z "$key" ]] && continue
+    current="$(get_env_value "$key" "$env_file")"
+    value="$(get_env_value "$key" "$legacy_file")"
+    if [[ -z "$current" && -n "$value" ]]; then
+      set_env_value "$key" "$value" "$env_file"
+      migrated=1
+    fi
+  done < <(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$legacy_file")
+
+  if [[ "$migrated" -eq 1 ]]; then
+    echo "==> Migrated missing values from legacy env file: $legacy_file"
+  fi
+}
+
 random_hex() {
   local bytes="${1:-16}"
   if command -v openssl >/dev/null 2>&1; then
@@ -443,7 +469,7 @@ main() {
   need_cmd systemctl
   need_cmd getent
 
-  local arch release_tag app_url web_url app_tar web_tar cli_user_home cli_user_link env_file asset_urls
+  local arch release_tag app_url web_url app_tar web_tar cli_user_home cli_user_link env_file legacy_env_file asset_urls
   arch="$(detect_arch)"
   release_tag="$(resolve_version)"
   asset_urls="$(resolve_release_assets "$release_tag" "$arch")"
@@ -454,6 +480,7 @@ main() {
   cli_user_home="$(resolve_cli_user_home)"
   cli_user_link="${cli_user_home}/.local/bin/tele-auto"
   env_file="$INSTALL_DIR/etc/tele-auto.env"
+  legacy_env_file="$INSTALL_DIR/.env"
 
   echo "==> Installing ${APP_NAME}"
   echo "    repo: ${REPO}"
@@ -515,6 +542,7 @@ ENV
   else
     echo "==> Keeping existing env file: $env_file"
   fi
+  migrate_legacy_env_file "$env_file" "$legacy_env_file"
   ensure_admin_credentials "$env_file"
 
   if [[ -f "${TMP_DIR}/app/tele-auto.service" ]]; then
@@ -536,6 +564,7 @@ User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/etc/tele-auto.env
+Environment=TELE_AUTO_ENV_FILE=${INSTALL_DIR}/etc/tele-auto.env
 ExecStart=${INSTALL_DIR}/bin/tele-auto-control
 Restart=always
 RestartSec=3

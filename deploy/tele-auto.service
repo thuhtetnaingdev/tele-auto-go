@@ -9,6 +9,7 @@ User=__APP_USER__
 Group=__APP_GROUP__
 WorkingDirectory=__INSTALL_DIR__
 EnvironmentFile=__INSTALL_DIR__/etc/tele-auto.env
+Environment=TELE_AUTO_ENV_FILE=__INSTALL_DIR__/etc/tele-auto.env
 ExecStart=__INSTALL_DIR__/bin/tele-auto-control
 Restart=always
 RestartSec=3

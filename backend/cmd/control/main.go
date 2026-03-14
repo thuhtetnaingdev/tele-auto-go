@@ -358,7 +358,7 @@ func (s *apiServer) handleAdminCredentials(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	env, err := readDotEnv(".env")
+	env, err := readAppEnv()
 	if err != nil {
 		errorJSON(w, http.StatusInternalServerError, err)
 		return
@@ -412,7 +412,7 @@ func (s *apiServer) handleAdminCredentials(w http.ResponseWriter, r *http.Reques
 	env["ADMIN_PASSWORD_HASH"] = newHash
 	env["ADMIN_PASSWORD_SALT"] = newSalt
 	env["ADMIN_SESSION_SECRET"] = newSecret
-	if err := godotenv.Write(env, ".env"); err != nil {
+	if err := godotenv.Write(env, appEnvPath()); err != nil {
 		errorJSON(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -695,7 +695,7 @@ type upsertAgentRequest struct {
 func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		env, err := readDotEnv(".env")
+		env, err := readAppEnv()
 		if err != nil {
 			errorJSON(w, http.StatusInternalServerError, err)
 			return
@@ -716,7 +716,7 @@ func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		allowed := allowedSettingSet()
-		env, err := readDotEnv(".env")
+		env, err := readAppEnv()
 		if err != nil {
 			errorJSON(w, http.StatusInternalServerError, err)
 			return
@@ -729,7 +729,7 @@ func (s *apiServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 			env[key] = strings.TrimSpace(value)
 			_ = os.Setenv(key, strings.TrimSpace(value))
 		}
-		if err := godotenv.Write(env, ".env"); err != nil {
+		if err := godotenv.Write(env, appEnvPath()); err != nil {
 			errorJSON(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1714,7 +1714,7 @@ type updateSoulRequest struct {
 }
 
 func (s *apiServer) handleSoul(w http.ResponseWriter, r *http.Request) {
-	env, err := readDotEnv(".env")
+	env, err := readAppEnv()
 	if err != nil {
 		errorJSON(w, http.StatusInternalServerError, err)
 		return
@@ -2142,6 +2142,32 @@ func readDotEnv(path string) (map[string]string, error) {
 		return map[string]string{}, nil
 	}
 	return nil, err
+}
+
+func appEnvPath() string {
+	return config.ResolveEnvFilePath()
+}
+
+func readAppEnv() (map[string]string, error) {
+	env, err := readDotEnv(appEnvPath())
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range allowedSettingKeys {
+		if strings.TrimSpace(env[key]) == "" {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+				env[key] = value
+			}
+		}
+	}
+	for _, key := range []string{"SOUL_PROMPT_PATH", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "ADMIN_PASSWORD_SALT", "ADMIN_SESSION_SECRET"} {
+		if strings.TrimSpace(env[key]) == "" {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+				env[key] = value
+			}
+		}
+	}
+	return env, nil
 }
 
 func pickAllowedValues(env map[string]string) map[string]string {

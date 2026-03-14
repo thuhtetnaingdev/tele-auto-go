@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -63,7 +64,7 @@ const (
 )
 
 func LoadForApp() (Config, error) {
-	_ = godotenv.Load()
+	loadEnvDefaults()
 
 	cfg := Config{
 		Port:           getInt("PORT", 3000),
@@ -117,7 +118,7 @@ func LoadForApp() (Config, error) {
 }
 
 func LoadForLogin() (Config, error) {
-	_ = godotenv.Load()
+	loadEnvDefaults()
 
 	cfg := Config{}
 	var err error
@@ -196,4 +197,34 @@ func getBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return raw == "true"
+}
+
+func ResolveEnvFilePath() string {
+	if explicit := strings.TrimSpace(os.Getenv("TELE_AUTO_ENV_FILE")); explicit != "" {
+		return explicit
+	}
+	candidates := []string{
+		"./etc/tele-auto.env",
+		".env",
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ".env"
+}
+
+func loadEnvDefaults() {
+	path := ResolveEnvFilePath()
+	if strings.TrimSpace(path) == "" {
+		_ = godotenv.Load()
+		return
+	}
+	if filepath.Clean(path) == ".env" {
+		_ = godotenv.Load(path)
+		return
+	}
+	_ = godotenv.Load(path)
+	_ = godotenv.Load(".env")
 }
