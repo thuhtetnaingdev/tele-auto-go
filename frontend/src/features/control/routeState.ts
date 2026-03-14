@@ -1,6 +1,6 @@
 import type { MainPage, SettingsPage } from '@/features/control/types'
 
-export const SETTINGS_PAGES: SettingsPage[] = ['soul', 'telegram', 'setting', 'behavior', 'variables', 'user']
+export const SETTINGS_PAGES: SettingsPage[] = ['soul', 'telegram', 'setting', 'behavior', 'variables', 'user', 'persona-groups', 'persona-users']
 
 export function readRouteState(pathname: string): { activePage: MainPage; activeSettingsPage: SettingsPage } {
   if (pathname.startsWith('/logs')) {
@@ -32,9 +32,13 @@ export function formatCurrentPageLabel(activePage: MainPage, activeSettingsPage:
           ? 'Behavior'
           : activeSettingsPage === 'setting'
             ? 'Setting'
-            : activeSettingsPage === 'variables'
-              ? 'Global Variables'
-              : 'User'}`
+              : activeSettingsPage === 'variables'
+                ? 'Global Variables'
+                : activeSettingsPage === 'persona-groups'
+                  ? 'Persona Groups'
+                  : activeSettingsPage === 'persona-users'
+                    ? 'Persona Users'
+                    : 'User'}`
   }
   if (activePage === 'agents') {
     return 'Agents'

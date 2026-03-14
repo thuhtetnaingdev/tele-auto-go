@@ -14,7 +14,16 @@ import {
   secretSettingKeys,
   settingLabels,
 } from '@/features/control/constants'
-import type { BehaviorPolicy, BehaviorRuntimeState, MainPage, SettingsPage, VariableValue } from '@/features/control/types'
+import type {
+  BehaviorPolicy,
+  BehaviorRuntimeState,
+  MainPage,
+  PersonaGroup,
+  PersonaGroupMember,
+  PersonaUserProfile,
+  SettingsPage,
+  VariableValue,
+} from '@/features/control/types'
 
 type SettingsPanelsProps = {
   activePage: MainPage
@@ -54,6 +63,40 @@ type SettingsPanelsProps = {
   onSaveVariable: () => Promise<void>
   variables: VariableValue[]
   onDeleteVariable: (key: string) => Promise<void>
+  personaGroups: PersonaGroup[]
+  selectedPersonaGroupId: string
+  onSelectPersonaGroupId: (id: string) => void
+  personaGroupMembers: PersonaGroupMember[]
+  personaGroupForm: {
+    id: string
+    name: string
+    slug: string
+    description: string
+    markdown: string
+  }
+  onPersonaGroupFormChange: (next: { id: string; name: string; slug: string; description: string; markdown: string }) => void
+  onSavePersonaGroup: () => Promise<void>
+  onDeletePersonaGroup: (id: string) => Promise<void>
+  personaMemberUserId: string
+  onPersonaMemberUserIdChange: (value: string) => void
+  personaMemberUsername: string
+  onPersonaMemberUsernameChange: (value: string) => void
+  onAddPersonaGroupMember: () => Promise<void>
+  onDeletePersonaGroupMember: (memberID: number) => Promise<void>
+  personaUsers: PersonaUserProfile[]
+  selectedPersonaUserId: string
+  onSelectPersonaUserId: (id: string) => void
+  personaUserForm: {
+    id: string
+    label: string
+    userId: string
+    username: string
+    enabled: boolean
+    markdown: string
+  }
+  onPersonaUserFormChange: (next: { id: string; label: string; userId: string; username: string; enabled: boolean; markdown: string }) => void
+  onSavePersonaUser: () => Promise<void>
+  onDeletePersonaUser: (id: string) => Promise<void>
   currentAdminPassword: string
   newAdminUsername: string
   newAdminPassword: string
@@ -103,6 +146,27 @@ export function SettingsPanels({
   onSaveVariable,
   variables,
   onDeleteVariable,
+  personaGroups,
+  selectedPersonaGroupId,
+  onSelectPersonaGroupId,
+  personaGroupMembers,
+  personaGroupForm,
+  onPersonaGroupFormChange,
+  onSavePersonaGroup,
+  onDeletePersonaGroup,
+  personaMemberUserId,
+  onPersonaMemberUserIdChange,
+  personaMemberUsername,
+  onPersonaMemberUsernameChange,
+  onAddPersonaGroupMember,
+  onDeletePersonaGroupMember,
+  personaUsers,
+  selectedPersonaUserId,
+  onSelectPersonaUserId,
+  personaUserForm,
+  onPersonaUserFormChange,
+  onSavePersonaUser,
+  onDeletePersonaUser,
   currentAdminPassword,
   newAdminUsername,
   newAdminPassword,
@@ -450,6 +514,142 @@ export function SettingsPanels({
               </div>
             ))}
             {variables.length === 0 ? <p className="text-xs text-muted-foreground">No variables yet.</p> : null}
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (activeSettingsPage === 'persona-groups') {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Persona Groups</CardTitle>
+          <CardDescription>Create group-level sub personalities and assign users by user ID or username.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="space-y-2">
+              <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                {personaGroups.map((group) => (
+                  <button
+                    type="button"
+                    key={group.id}
+                    className={`mb-1 w-full rounded border px-2 py-2 text-left text-sm last:mb-0 ${selectedPersonaGroupId === group.id ? 'border-primary bg-primary/5' : 'border-border/50 bg-background'}`}
+                    onClick={() => onSelectPersonaGroupId(selectedPersonaGroupId === group.id ? '' : group.id)}
+                  >
+                    <p className="font-semibold">{group.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      slug: {group.slug} • members: {group.memberCount}
+                    </p>
+                  </button>
+                ))}
+                {personaGroups.length === 0 ? <p className="text-xs text-muted-foreground">No persona groups yet.</p> : null}
+              </div>
+              {selectedPersonaGroupId ? (
+                <Button size="sm" variant="destructive" onClick={() => void onDeletePersonaGroup(selectedPersonaGroupId)} disabled={busy}>
+                  Delete Selected Group
+                </Button>
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <Input placeholder="Name (required)" value={personaGroupForm.name} onChange={(event) => onPersonaGroupFormChange({ ...personaGroupForm, name: event.target.value })} className="h-9" />
+              <Input placeholder="slug (optional)" value={personaGroupForm.slug} onChange={(event) => onPersonaGroupFormChange({ ...personaGroupForm, slug: event.target.value })} className="h-9" />
+              <Textarea placeholder="Description" value={personaGroupForm.description} onChange={(event) => onPersonaGroupFormChange({ ...personaGroupForm, description: event.target.value })} className="min-h-[90px] text-sm" />
+              <Textarea
+                placeholder="Markdown Description / Sub personality"
+                value={personaGroupForm.markdown}
+                onChange={(event) => onPersonaGroupFormChange({ ...personaGroupForm, markdown: event.target.value })}
+                className="min-h-[140px] font-mono text-xs"
+              />
+              <Button size="sm" onClick={() => void onSavePersonaGroup()} disabled={busy}>
+                <Save className="size-4" /> {personaGroupForm.id ? 'Update Group' : 'Create Group'}
+              </Button>
+            </div>
+          </div>
+          {selectedPersonaGroupId ? (
+            <div className="space-y-3 rounded-lg border border-border/60 bg-background p-3">
+              <p className="text-sm font-semibold">Members</p>
+              <div className="grid gap-2 md:grid-cols-3">
+                <Input placeholder="userId (e.g. 12345)" value={personaMemberUserId} onChange={(event) => onPersonaMemberUserIdChange(event.target.value)} className="h-9" />
+                <Input placeholder="username (e.g. @alice)" value={personaMemberUsername} onChange={(event) => onPersonaMemberUsernameChange(event.target.value)} className="h-9" />
+                <Button size="sm" onClick={() => void onAddPersonaGroupMember()} disabled={busy}>
+                  Add Member
+                </Button>
+              </div>
+              <div className="max-h-44 overflow-auto rounded border border-border/50 p-2 text-sm">
+                {personaGroupMembers.map((member) => (
+                  <div key={member.id} className="mb-1 flex items-center justify-between rounded border border-border/40 px-2 py-1 last:mb-0">
+                    <p className="text-xs">
+                      {member.userId || '-'} {member.username ? `• ${member.username}` : ''}
+                    </p>
+                    <Button size="sm" variant="destructive" onClick={() => void onDeletePersonaGroupMember(member.id)} disabled={busy}>
+                      Remove
+                    </Button>
+                  </div>
+                ))}
+                {personaGroupMembers.length === 0 ? <p className="text-xs text-muted-foreground">No members yet.</p> : null}
+              </div>
+              <Button size="sm" onClick={() => void onSavePersonaGroup()} disabled={busy}>
+                <Save className="size-4" /> Save Group + Markdown
+              </Button>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (activeSettingsPage === 'persona-users') {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Persona Users</CardTitle>
+          <CardDescription>Create per-user sub personalities with higher priority than group persona.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="space-y-2">
+              <div className="max-h-52 overflow-auto rounded-lg border border-border/60 bg-background p-2 text-sm">
+                {personaUsers.map((user) => (
+                  <button
+                    type="button"
+                    key={user.id}
+                    className={`mb-1 w-full rounded border px-2 py-2 text-left text-sm last:mb-0 ${selectedPersonaUserId === user.id ? 'border-primary bg-primary/5' : 'border-border/50 bg-background'}`}
+                    onClick={() => onSelectPersonaUserId(selectedPersonaUserId === user.id ? '' : user.id)}
+                  >
+                    <p className="font-semibold">{user.label}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {user.enabled ? 'enabled' : 'disabled'} • {user.userId || '-'} {user.username ? `• ${user.username}` : ''}
+                    </p>
+                  </button>
+                ))}
+                {personaUsers.length === 0 ? <p className="text-xs text-muted-foreground">No persona users yet.</p> : null}
+              </div>
+              {selectedPersonaUserId ? (
+                <Button size="sm" variant="destructive" onClick={() => void onDeletePersonaUser(selectedPersonaUserId)} disabled={busy}>
+                  Delete Selected User Profile
+                </Button>
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <Input placeholder="Label (required)" value={personaUserForm.label} onChange={(event) => onPersonaUserFormChange({ ...personaUserForm, label: event.target.value })} className="h-9" />
+              <Input placeholder="userId (optional)" value={personaUserForm.userId} onChange={(event) => onPersonaUserFormChange({ ...personaUserForm, userId: event.target.value })} className="h-9" />
+              <Input placeholder="username (optional)" value={personaUserForm.username} onChange={(event) => onPersonaUserFormChange({ ...personaUserForm, username: event.target.value })} className="h-9" />
+              <div className="flex items-center gap-2 text-sm">
+                <Switch checked={personaUserForm.enabled} onCheckedChange={(checked) => onPersonaUserFormChange({ ...personaUserForm, enabled: checked })} />
+                <span>{personaUserForm.enabled ? 'Enabled' : 'Disabled'}</span>
+              </div>
+              <Textarea
+                placeholder="Markdown Description / Sub personality"
+                value={personaUserForm.markdown}
+                onChange={(event) => onPersonaUserFormChange({ ...personaUserForm, markdown: event.target.value })}
+                className="min-h-[140px] font-mono text-xs"
+              />
+              <Button size="sm" onClick={() => void onSavePersonaUser()} disabled={busy}>
+                <Save className="size-4" /> {personaUserForm.id ? 'Update Persona User' : 'Create Persona User'}
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>

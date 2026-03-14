@@ -125,3 +125,75 @@ func TestBehaviorRuntimeEscalationLifecycle(t *testing.T) {
 		t.Fatalf("unexpected cleared state: %#v", cleared)
 	}
 }
+
+func TestPersonaStoreCreateAndResolve(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	group, err := s.CreatePersonaGroup(ctx, PersonaGroupInput{
+		Name:         "Manager",
+		Slug:         "manager",
+		Description:  "manager style",
+		MarkdownPath: "/tmp/manager.md",
+	})
+	if err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	member, err := s.CreatePersonaGroupMember(ctx, PersonaGroupMemberInput{
+		GroupID:  group.ID,
+		UserID:   "123",
+		Username: "@Alice",
+	})
+	if err != nil {
+		t.Fatalf("create group member: %v", err)
+	}
+	if member.NormalizedUsername != "alice" {
+		t.Fatalf("expected normalized username alice, got %q", member.NormalizedUsername)
+	}
+	if _, err := s.CreatePersonaGroupMember(ctx, PersonaGroupMemberInput{GroupID: group.ID, UserID: "123"}); err == nil {
+		t.Fatalf("expected unique user id collision for group members")
+	}
+
+	byID, ok, err := s.FindPersonaGroupByUserID(ctx, "123")
+	if err != nil {
+		t.Fatalf("find group by user id: %v", err)
+	}
+	if !ok || byID.ID != group.ID {
+		t.Fatalf("unexpected group by id result: %#v, ok=%v", byID, ok)
+	}
+	byUsername, ok, err := s.FindPersonaGroupByUsername(ctx, "@ALICE")
+	if err != nil {
+		t.Fatalf("find group by username: %v", err)
+	}
+	if !ok || byUsername.ID != group.ID {
+		t.Fatalf("unexpected group by username result: %#v, ok=%v", byUsername, ok)
+	}
+
+	profile, err := s.CreatePersonaUserProfile(ctx, PersonaUserProfileInput{
+		Label:        "Best Friend",
+		UserID:       "123",
+		Username:     "@Alice",
+		MarkdownPath: "/tmp/best-friend.md",
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	if profile.NormalizedUsername != "alice" {
+		t.Fatalf("expected normalized username alice, got %q", profile.NormalizedUsername)
+	}
+	byProfileID, ok, err := s.FindPersonaUserProfileByUserID(ctx, "123")
+	if err != nil {
+		t.Fatalf("find profile by user id: %v", err)
+	}
+	if !ok || byProfileID.ID != profile.ID {
+		t.Fatalf("unexpected profile by id result: %#v, ok=%v", byProfileID, ok)
+	}
+	byProfileUsername, ok, err := s.FindPersonaUserProfileByUsername(ctx, "@ALICE")
+	if err != nil {
+		t.Fatalf("find profile by username: %v", err)
+	}
+	if !ok || byProfileUsername.ID != profile.ID {
+		t.Fatalf("unexpected profile by username result: %#v, ok=%v", byProfileUsername, ok)
+	}
+}

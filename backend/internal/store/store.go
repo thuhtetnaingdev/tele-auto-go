@@ -177,6 +177,11 @@ CREATE TABLE IF NOT EXISTS behavior_runtime_states (
 		return nil, err
 	}
 
+	if err := ensurePersonaSchema(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
 }
 

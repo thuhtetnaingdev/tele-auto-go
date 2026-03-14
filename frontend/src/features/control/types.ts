@@ -173,6 +173,55 @@ export type BehaviorRuntimeResponse = {
   states: BehaviorRuntimeState[]
 }
 
+export type PersonaGroup = {
+  id: string
+  name: string
+  slug: string
+  description: string
+  path: string
+  memberCount: number
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type PersonaGroupMember = {
+  id: number
+  groupId: string
+  userId?: string
+  username?: string
+  normalizedUsername?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type PersonaUserProfile = {
+  id: string
+  label: string
+  userId?: string
+  username?: string
+  normalizedUsername?: string
+  path: string
+  enabled: boolean
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type ResolvedPersona = {
+  source: 'soul_only' | 'group' | 'user_override'
+  groupId?: string
+  groupName?: string
+  userProfileId?: string
+  userLabel?: string
+  composedPrompt: string
+}
+
+export type PersonaResolveResponse = {
+  chatId?: string
+  userId?: string
+  username?: string
+  resolved: ResolvedPersona
+}
+
 export type ConfirmDialogState = {
   open: boolean
   title: string
@@ -184,4 +233,4 @@ export type ConfirmDialogState = {
 }
 
 export type MainPage = 'dashboard' | 'logs' | 'agents' | 'settings'
-export type SettingsPage = 'soul' | 'telegram' | 'setting' | 'behavior' | 'variables' | 'user'
+export type SettingsPage = 'soul' | 'telegram' | 'setting' | 'behavior' | 'variables' | 'user' | 'persona-groups' | 'persona-users'

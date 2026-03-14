@@ -19,6 +19,7 @@ import (
 	"tele-auto-go/internal/config"
 	"tele-auto-go/internal/contextbuilder"
 	"tele-auto-go/internal/orchestrator"
+	"tele-auto-go/internal/persona"
 	"tele-auto-go/internal/store"
 	"tele-auto-go/internal/util"
 
@@ -37,6 +38,7 @@ type Service struct {
 	db         *store.Store
 	ai         *ai.Client
 	soulPrompt string
+	persona    *persona.Engine
 	behavior   behavior.LoadedPolicy
 	orch       *orchestrator.Engine
 	onEvent    func(Event)
@@ -100,11 +102,16 @@ func NewService(cfg config.Config, logger *slog.Logger, db *store.Store, aiClien
 	}
 
 	return &Service{
-		cfg:            cfg,
-		logger:         logger,
-		db:             db,
-		ai:             aiClient,
-		soulPrompt:     soulPrompt,
+		cfg:        cfg,
+		logger:     logger,
+		db:         db,
+		ai:         aiClient,
+		soulPrompt: soulPrompt,
+		persona: persona.NewEngine(db, logger, persona.Options{
+			GroupRoot:        cfg.Persona.GroupsDir,
+			UserRoot:         cfg.Persona.UsersDir,
+			MaxMarkdownBytes: cfg.Persona.MaxMarkdownBytes,
+		}),
 		behavior:       behavior.Load(cfg.BehaviorPath, logger),
 		orch:           orch,
 		onEvent:        onEvent,
@@ -525,6 +532,35 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 	}
 
 	constraints := behavior.SampleConstraints(s.currentBehaviorPolicy())
+	personaPrompt := s.soulPrompt
+	personaSource := "soul_only"
+	personaResolved := persona.ResolvedPersona{}
+	personaResolved, perr := s.persona.Resolve(ctx, persona.ResolveInput{
+		ChatID:   req.ChatID,
+		UserID:   req.TriggerUserID,
+		Username: req.TriggerUsername,
+	}, s.soulPrompt)
+	if perr != nil {
+		s.logger.Warn("persona resolve failed; fallback to base SOUL", "chat_id", req.ChatID, "error", perr.Error())
+	} else {
+		personaSource = strings.TrimSpace(personaResolved.Source)
+		if strings.TrimSpace(personaResolved.ComposedPrompt) != "" {
+			personaPrompt = personaResolved.ComposedPrompt
+		}
+	}
+	s.logger.Info(
+		"persona_loaded",
+		"chat_id", req.ChatID,
+		"message_id", req.TriggerMessageID,
+		"trigger_user_id", strings.TrimSpace(req.TriggerUserID),
+		"trigger_username", strings.TrimSpace(req.TriggerUsername),
+		"persona_source", personaSource,
+		"group_id", strings.TrimSpace(personaResolved.GroupID),
+		"group_name", strings.TrimSpace(personaResolved.GroupName),
+		"user_profile_id", strings.TrimSpace(personaResolved.UserProfileID),
+		"user_label", strings.TrimSpace(personaResolved.UserLabel),
+		"persona_chars", len(strings.TrimSpace(personaPrompt)),
+	)
 
 	reply := ""
 	replySource := "none"
@@ -537,7 +573,7 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 			TriggerMessage:  req.TriggerMessageID,
 			TriggerUserID:   req.TriggerUserID,
 			TriggerUsername: req.TriggerUsername,
-		}, s.soulPrompt, constraints)
+		}, personaPrompt, constraints)
 		if err != nil {
 			s.logger.Warn("orchestrator failed; fallback to legacy reply", "error", err.Error())
 		} else if strings.TrimSpace(reply) != "" {
@@ -557,7 +593,7 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 			req.ChatName,
 			toContextLines(history),
 			req.LatestIncoming,
-			s.soulPrompt,
+			personaPrompt,
 			constraints,
 		)
 		reply, err = s.ai.GenerateReply(ctx, systemPrompt, userPrompt)
@@ -614,6 +650,7 @@ func (s *Service) executeAutoReply(ctx context.Context, req autoReplyRequest) er
 		"message_id", req.TriggerMessageID,
 		"context_count", len(history),
 		"source", replySource,
+		"persona_source", personaSource,
 		"reply_preview", truncatePreview(reply, 220),
 	)
 	return nil

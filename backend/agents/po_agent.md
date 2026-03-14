@@ -11,7 +11,7 @@ variables:
 - TOKEN
 visibility: private
 allow_users:
-- fyuanjjk
+- konglong_19
 - morpheus_enles
 temperature: 0.35
 ---

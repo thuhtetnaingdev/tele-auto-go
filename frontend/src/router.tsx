@@ -67,6 +67,16 @@ const settingsUserRoute = createRoute({
   path: '/settings/user',
 })
 
+const settingsPersonaGroupsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/settings/persona-groups',
+})
+
+const settingsPersonaUsersRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/settings/persona-users',
+})
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   dashboardRoute,
@@ -79,6 +89,8 @@ const routeTree = rootRoute.addChildren([
   settingsBehaviorRoute,
   settingsVariablesRoute,
   settingsUserRoute,
+  settingsPersonaGroupsRoute,
+  settingsPersonaUsersRoute,
 ])
 
 export const router = createRouter({ routeTree })

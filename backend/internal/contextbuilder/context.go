@@ -21,7 +21,7 @@ const baseSystemPrompt = "You are replying as a real human Telegram user. " +
 	"No markdown, no labels, no explanation, no quotes. " +
 	"Do not mention being AI. Return only the final reply text."
 
-func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPrompt string, constraints behavior.Constraints) (systemPrompt, userPrompt string) {
+func Build(chatWith string, recent []MessageLine, latestIncoming string, personaPrompt string, constraints behavior.Constraints) (systemPrompt, userPrompt string) {
 	if strings.TrimSpace(chatWith) == "" {
 		chatWith = "unknown"
 	}
@@ -51,18 +51,18 @@ func Build(chatWith string, recent []MessageLine, latestIncoming string, soulPro
 	}, "\n")
 
 	systemPrompt = baseSystemPrompt
-	soulPrompt = strings.TrimSpace(soulPrompt)
-	if soulPrompt != "" {
-		if len(soulPrompt) > 4000 {
-			soulPrompt = soulPrompt[:4000]
+	personaPrompt = strings.TrimSpace(personaPrompt)
+	if personaPrompt != "" {
+		if len(personaPrompt) > 5000 {
+			personaPrompt = personaPrompt[:5000]
 		}
 		systemPrompt = strings.Join([]string{
 			baseSystemPrompt,
 			"",
-			"Personality and reply-style profile (SOUL.md):",
-			soulPrompt,
+			"Personality and reply-style profile (SOUL + optional layered sub personality):",
+			personaPrompt,
 			"",
-			"Use SOUL only if it does not conflict with hard rules above.",
+			"Use persona profile only if it does not conflict with hard rules above.",
 		}, "\n")
 	}
 

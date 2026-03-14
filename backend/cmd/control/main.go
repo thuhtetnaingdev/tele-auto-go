@@ -32,6 +32,7 @@ import (
 	"tele-auto-go/internal/conversationstream"
 	"tele-auto-go/internal/logging"
 	"tele-auto-go/internal/logstream"
+	"tele-auto-go/internal/persona"
 	"tele-auto-go/internal/store"
 	tgsvc "tele-auto-go/internal/telegram"
 	"tele-auto-go/internal/tgauth"
@@ -47,6 +48,7 @@ type apiServer struct {
 	adminAuth    *adminauth.Manager
 	agentMgr     *agents.Manager
 	db           *store.Store
+	persona      *persona.Engine
 	adminMu      sync.RWMutex
 
 	otpMu      sync.Mutex
@@ -115,6 +117,11 @@ func main() {
 	}
 	defer st.Close()
 	server.db = st
+	server.persona = persona.NewEngine(st, logger, persona.Options{
+		GroupRoot:        readPersonaGroupsDir(),
+		UserRoot:         readPersonaUsersDir(),
+		MaxMarkdownBytes: readIntEnv("PERSONA_MAX_MARKDOWN_BYTES", 16000),
+	})
 
 	agentsDir := strings.TrimSpace(os.Getenv("AGENTS_DIR"))
 	if agentsDir == "" {
@@ -184,6 +191,22 @@ func main() {
 		protected.GET("/behavior", gin.WrapF(server.handleBehavior))
 		protected.PUT("/behavior", gin.WrapF(server.handleBehavior))
 		protected.GET("/behavior/runtime", gin.WrapF(server.handleBehaviorRuntime))
+		protected.GET("/persona/groups", gin.WrapF(server.handlePersonaGroups))
+		protected.POST("/persona/groups", gin.WrapF(server.handlePersonaGroups))
+		protected.GET("/persona/groups/:id", gin.WrapF(server.handlePersonaGroupByID))
+		protected.PUT("/persona/groups/:id", gin.WrapF(server.handlePersonaGroupByID))
+		protected.DELETE("/persona/groups/:id", gin.WrapF(server.handlePersonaGroupByID))
+		protected.GET("/persona/groups/:id/members", gin.WrapF(server.handlePersonaGroupMembers))
+		protected.POST("/persona/groups/:id/members", gin.WrapF(server.handlePersonaGroupMembers))
+		protected.DELETE("/persona/groups/:id/members/:memberID", gin.WrapF(server.handlePersonaGroupMembers))
+		protected.PUT("/persona/groups/:id/content", gin.WrapF(server.handlePersonaGroupContent))
+		protected.GET("/persona/users", gin.WrapF(server.handlePersonaUsers))
+		protected.POST("/persona/users", gin.WrapF(server.handlePersonaUsers))
+		protected.GET("/persona/users/:id", gin.WrapF(server.handlePersonaUserByID))
+		protected.PUT("/persona/users/:id", gin.WrapF(server.handlePersonaUserByID))
+		protected.DELETE("/persona/users/:id", gin.WrapF(server.handlePersonaUserByID))
+		protected.PUT("/persona/users/:id/content", gin.WrapF(server.handlePersonaUserContent))
+		protected.GET("/persona/resolve", gin.WrapF(server.handlePersonaResolve))
 		protected.GET("/soul", gin.WrapF(server.handleSoul))
 		protected.PUT("/soul", gin.WrapF(server.handleSoul))
 		protected.GET("/logs", gin.WrapF(server.handleLogs))
@@ -954,6 +977,34 @@ type sendConversationMessageRequest struct {
 
 type updateBehaviorPolicyRequest = behavior.Policy
 
+type upsertPersonaGroupRequest struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Slug        string  `json:"slug"`
+	Description string  `json:"description"`
+	Path        string  `json:"path"`
+	Markdown    *string `json:"markdown"`
+}
+
+type upsertPersonaGroupMemberRequest struct {
+	UserID   string `json:"userId"`
+	Username string `json:"username"`
+}
+
+type upsertPersonaUserProfileRequest struct {
+	ID       string  `json:"id"`
+	Label    string  `json:"label"`
+	UserID   string  `json:"userId"`
+	Username string  `json:"username"`
+	Path     string  `json:"path"`
+	Enabled  *bool   `json:"enabled"`
+	Markdown *string `json:"markdown"`
+}
+
+type updatePersonaContentRequest struct {
+	Content string `json:"content"`
+}
+
 func readBehaviorPathFromEnv() string {
 	path := strings.TrimSpace(os.Getenv("BEHAVIOR_POLICY_PATH"))
 	if path == "" {
@@ -1022,6 +1073,408 @@ func (s *apiServer) handleBehaviorRuntime(w http.ResponseWriter, r *http.Request
 		"loadedAt": loaded.LoadedAt.Format(time.RFC3339Nano),
 		"policy":   loaded.Policy,
 		"states":   states,
+	})
+}
+
+func (s *apiServer) handlePersonaGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.db.ListPersonaGroups(r.Context())
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"groups": items})
+	case http.MethodPost:
+		var req upsertPersonaGroupRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		path := strings.TrimSpace(req.Path)
+		if path == "" {
+			seed := strings.TrimSpace(req.Slug)
+			if seed == "" {
+				seed = strings.TrimSpace(req.Name)
+			}
+			path = s.persona.DefaultGroupMarkdownPath(seed)
+		}
+		group, err := s.db.CreatePersonaGroup(r.Context(), store.PersonaGroupInput{
+			ID:           req.ID,
+			Name:         req.Name,
+			Slug:         req.Slug,
+			Description:  req.Description,
+			MarkdownPath: path,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		markdown := ""
+		if req.Markdown != nil {
+			markdown = *req.Markdown
+		}
+		if _, err := s.persona.WriteGroupMarkdown(group.MarkdownPath, markdown); err != nil {
+			s.logger.Warn("failed to initialize group markdown file", "group_id", group.ID, "error", err.Error())
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handlePersonaGroupByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/persona/groups/"))
+	if id == "" || strings.Contains(id, "/") {
+		errorJSON(w, http.StatusNotFound, errors.New("persona group not found"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		group, ok, err := s.db.GetPersonaGroup(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			errorJSON(w, http.StatusNotFound, errors.New("persona group not found"))
+			return
+		}
+		content, _ := s.persona.ReadGroupMarkdown(group.MarkdownPath)
+		writeJSON(w, http.StatusOK, map[string]any{"group": group, "content": content})
+	case http.MethodPut:
+		existing, ok, err := s.db.GetPersonaGroup(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			errorJSON(w, http.StatusNotFound, errors.New("persona group not found"))
+			return
+		}
+		var req upsertPersonaGroupRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		path := strings.TrimSpace(req.Path)
+		if path == "" {
+			path = existing.MarkdownPath
+		}
+		group, err := s.db.UpdatePersonaGroup(r.Context(), id, store.PersonaGroupInput{
+			ID:           id,
+			Name:         req.Name,
+			Slug:         req.Slug,
+			Description:  req.Description,
+			MarkdownPath: path,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Markdown != nil {
+			if _, err := s.persona.WriteGroupMarkdown(group.MarkdownPath, *req.Markdown); err != nil {
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+	case http.MethodDelete:
+		deleted, err := s.db.DeletePersonaGroup(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !deleted {
+			errorJSON(w, http.StatusNotFound, errors.New("persona group not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handlePersonaGroupMembers(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/persona/groups/"))
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 {
+		errorJSON(w, http.StatusNotFound, errors.New("persona group member route not found"))
+		return
+	}
+	groupID := strings.TrimSpace(parts[0])
+	action := strings.TrimSpace(parts[1])
+	if groupID == "" || action != "members" {
+		errorJSON(w, http.StatusNotFound, errors.New("persona group member route not found"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.db.ListPersonaGroupMembers(r.Context(), groupID)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"groupId": groupID, "members": items})
+	case http.MethodPost:
+		var req upsertPersonaGroupMemberRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		member, err := s.db.CreatePersonaGroupMember(r.Context(), store.PersonaGroupMemberInput{
+			GroupID:  groupID,
+			UserID:   req.UserID,
+			Username: req.Username,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "member": member})
+	case http.MethodDelete:
+		if len(parts) < 3 {
+			errorJSON(w, http.StatusBadRequest, errors.New("member id is required"))
+			return
+		}
+		memberID, err := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
+		if err != nil || memberID <= 0 {
+			errorJSON(w, http.StatusBadRequest, errors.New("invalid member id"))
+			return
+		}
+		deleted, err := s.db.DeletePersonaGroupMember(r.Context(), groupID, memberID)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !deleted {
+			errorJSON(w, http.StatusNotFound, errors.New("persona group member not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handlePersonaGroupContent(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/persona/groups/"))
+	id = strings.TrimSpace(strings.TrimSuffix(id, "/content"))
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w)
+		return
+	}
+	group, ok, err := s.db.GetPersonaGroup(r.Context(), id)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if !ok {
+		errorJSON(w, http.StatusNotFound, errors.New("persona group not found"))
+		return
+	}
+	var req updatePersonaContentRequest
+	if err := decodeJSON(r, &req); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	path, err := s.persona.WriteGroupMarkdown(group.MarkdownPath, req.Content)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "groupId": group.ID, "path": path})
+}
+
+func (s *apiServer) handlePersonaUsers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.db.ListPersonaUserProfiles(r.Context())
+		if err != nil {
+			errorJSON(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"users": items})
+	case http.MethodPost:
+		var req upsertPersonaUserProfileRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		path := strings.TrimSpace(req.Path)
+		if path == "" {
+			path = s.persona.DefaultUserMarkdownPath(req.Label, req.ID)
+		}
+		enabled := true
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
+		user, err := s.db.CreatePersonaUserProfile(r.Context(), store.PersonaUserProfileInput{
+			ID:           req.ID,
+			Label:        req.Label,
+			UserID:       req.UserID,
+			Username:     req.Username,
+			MarkdownPath: path,
+			Enabled:      enabled,
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		markdown := ""
+		if req.Markdown != nil {
+			markdown = *req.Markdown
+		}
+		if _, err := s.persona.WriteUserMarkdown(user.MarkdownPath, markdown); err != nil {
+			s.logger.Warn("failed to initialize user persona markdown file", "profile_id", user.ID, "error", err.Error())
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": user})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handlePersonaUserByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/persona/users/"))
+	if id == "" || strings.Contains(id, "/") {
+		errorJSON(w, http.StatusNotFound, errors.New("persona user profile not found"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		user, ok, err := s.db.GetPersonaUserProfile(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			errorJSON(w, http.StatusNotFound, errors.New("persona user profile not found"))
+			return
+		}
+		content, _ := s.persona.ReadUserMarkdown(user.MarkdownPath)
+		writeJSON(w, http.StatusOK, map[string]any{"user": user, "content": content})
+	case http.MethodPut:
+		existing, ok, err := s.db.GetPersonaUserProfile(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !ok {
+			errorJSON(w, http.StatusNotFound, errors.New("persona user profile not found"))
+			return
+		}
+		var req upsertPersonaUserProfileRequest
+		if err := decodeJSON(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		path := strings.TrimSpace(req.Path)
+		if path == "" {
+			path = existing.MarkdownPath
+		}
+		user, err := s.db.UpdatePersonaUserProfile(r.Context(), id, store.PersonaUserProfileInput{
+			ID:           id,
+			Label:        req.Label,
+			UserID:       req.UserID,
+			Username:     req.Username,
+			MarkdownPath: path,
+			Enabled: func() bool {
+				if req.Enabled == nil {
+					return existing.Enabled
+				}
+				return *req.Enabled
+			}(),
+		})
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Markdown != nil {
+			if _, err := s.persona.WriteUserMarkdown(user.MarkdownPath, *req.Markdown); err != nil {
+				errorJSON(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": user})
+	case http.MethodDelete:
+		deleted, err := s.db.DeletePersonaUserProfile(r.Context(), id)
+		if err != nil {
+			errorJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		if !deleted {
+			errorJSON(w, http.StatusNotFound, errors.New("persona user profile not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *apiServer) handlePersonaUserContent(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/persona/users/"))
+	id = strings.TrimSpace(strings.TrimSuffix(id, "/content"))
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w)
+		return
+	}
+	user, ok, err := s.db.GetPersonaUserProfile(r.Context(), id)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if !ok {
+		errorJSON(w, http.StatusNotFound, errors.New("persona user profile not found"))
+		return
+	}
+	var req updatePersonaContentRequest
+	if err := decodeJSON(r, &req); err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	path, err := s.persona.WriteUserMarkdown(user.MarkdownPath, req.Content)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "userId": user.ID, "path": path})
+}
+
+func (s *apiServer) handlePersonaResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	chatID := strings.TrimSpace(r.URL.Query().Get("chatId"))
+	userID := strings.TrimSpace(r.URL.Query().Get("userId"))
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	if userID == "" && strings.HasPrefix(chatID, "user:") {
+		userID = strings.TrimSpace(strings.TrimPrefix(chatID, "user:"))
+	}
+	soulPath := strings.TrimSpace(os.Getenv("SOUL_PROMPT_PATH"))
+	if soulPath == "" {
+		soulPath = "./SOUL.md"
+	}
+	soulPath = filepath.Clean(soulPath)
+	soulPrompt := ""
+	if b, err := os.ReadFile(soulPath); err == nil {
+		soulPrompt = string(b)
+	}
+	resolved, err := s.persona.Resolve(r.Context(), persona.ResolveInput{
+		ChatID:   chatID,
+		UserID:   userID,
+		Username: username,
+	}, soulPrompt)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chatId":   chatID,
+		"userId":   userID,
+		"username": username,
+		"resolved": resolved,
 	})
 }
 
@@ -1526,6 +1979,20 @@ func readWebDir() string {
 		return raw
 	}
 	return "./web"
+}
+
+func readPersonaGroupsDir() string {
+	if raw := strings.TrimSpace(os.Getenv("PERSONA_GROUPS_DIR")); raw != "" {
+		return raw
+	}
+	return "./personality/groups"
+}
+
+func readPersonaUsersDir() string {
+	if raw := strings.TrimSpace(os.Getenv("PERSONA_USERS_DIR")); raw != "" {
+		return raw
+	}
+	return "./personality/users"
 }
 
 func effectiveConversationMode(globalEnabled bool, mode string, hasMode bool, escalatedManual bool) string {

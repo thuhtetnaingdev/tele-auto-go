@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
-import type { ConversationMessage, ConversationSummary } from '@/features/control/types'
+import type { ConversationMessage, ConversationSummary, ResolvedPersona } from '@/features/control/types'
 
 type RealtimeConversationsCardProps = {
   globalAutoReplyEnabled: boolean
@@ -24,6 +24,7 @@ type RealtimeConversationsCardProps = {
   manualReplyText: string
   onManualReplyTextChange: (value: string) => void
   onSendManualReply: () => Promise<void>
+  resolvedPersona?: ResolvedPersona
 }
 
 export function RealtimeConversationsCard({
@@ -42,6 +43,7 @@ export function RealtimeConversationsCard({
   manualReplyText,
   onManualReplyTextChange,
   onSendManualReply,
+  resolvedPersona,
 }: RealtimeConversationsCardProps) {
   return (
     <Card>
@@ -105,6 +107,15 @@ export function RealtimeConversationsCard({
                   <div>
                     <p className="text-sm font-semibold">{selectedConversation.chatName || selectedConversation.chatId}</p>
                     <p className="text-xs text-muted-foreground">{selectedConversation.chatId}</p>
+                    {resolvedPersona ? (
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        Persona: {resolvedPersona.source === 'user_override'
+                          ? `SOUL + User (${resolvedPersona.userLabel || resolvedPersona.userProfileId || 'override'})`
+                          : resolvedPersona.source === 'group'
+                            ? `SOUL + Group (${resolvedPersona.groupName || resolvedPersona.groupId || 'group'})`
+                            : 'SOUL only'}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <Button

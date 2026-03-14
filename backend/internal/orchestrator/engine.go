@@ -58,7 +58,7 @@ func New(aiClient *ai.Client, agentManager *agents.Manager, st *store.Store, log
 	}
 }
 
-func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt string, constraints behavior.Constraints) (string, error) {
+func (e *Engine) Handle(ctx context.Context, mc MessageContext, personaPrompt string, constraints behavior.Constraints) (string, error) {
 	started := time.Now()
 	run := store.OrchestrationRun{
 		ChatID:         mc.ChatID,
@@ -140,7 +140,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		"agent_body_preview", truncateText(agentInstructions, 260),
 	)
 
-	decision, err := e.decideToolCall(ctx, agent, agentInstructions, mc, soulPrompt, constraints)
+	decision, err := e.decideToolCall(ctx, agent, agentInstructions, mc, personaPrompt, constraints)
 	if err != nil {
 		run.ErrorMessage = "tool decide: " + err.Error()
 		return e.fail(mc, run, started, "decide_tool_call", "Sorry, failed to process request.")
@@ -172,7 +172,7 @@ func (e *Engine) Handle(ctx context.Context, mc MessageContext, soulPrompt strin
 		}
 	}
 
-	finalReply, err := e.synthesize(ctx, agent, agentInstructions, mc, decision, toolResp, soulPrompt, constraints, types)
+	finalReply, err := e.synthesize(ctx, agent, agentInstructions, mc, decision, toolResp, personaPrompt, constraints, types)
 	if err != nil {
 		run.ErrorMessage = "synthesize: " + err.Error()
 		return e.fail(mc, run, started, "synthesize_reply", "Sorry, failed to compose final response.")
@@ -312,7 +312,7 @@ func (e *Engine) routeAgent(ctx context.Context, mc MessageContext, agentsList [
 	return RouterResult{}, fmt.Errorf("router selected unknown agent: %s", parsed.AgentID)
 }
 
-func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentInstructions string, mc MessageContext, soulPrompt string, constraints behavior.Constraints) (toolDecision, error) {
+func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentInstructions string, mc MessageContext, personaPrompt string, constraints behavior.Constraints) (toolDecision, error) {
 	history := make([]string, 0, len(mc.RecentMessages))
 	for i, line := range mc.RecentMessages {
 		history = append(history, fmt.Sprintf("%d. [%s] %s", i+1, line.Direction, line.Text))
@@ -334,8 +334,8 @@ func (e *Engine) decideToolCall(ctx context.Context, agent agents.Agent, agentIn
 		"Behavior constraints:",
 		behavior.BuildInstructionText(constraints),
 		"",
-		"SOUL prompt:",
-		soulPrompt,
+		"Persona prompt (SOUL + optional sub personality):",
+		personaPrompt,
 		"",
 		"Recent conversation:",
 		strings.Join(history, "\n"),
@@ -400,7 +400,7 @@ func (e *Engine) synthesize(
 	mc MessageContext,
 	decision toolDecision,
 	toolResp apiToolResponse,
-	soulPrompt string,
+	personaPrompt string,
 	constraints behavior.Constraints,
 	varTypes map[string]string,
 ) (string, error) {
@@ -427,8 +427,8 @@ func (e *Engine) synthesize(
 		"Behavior constraints:",
 		behavior.BuildInstructionText(constraints),
 		"",
-		"SOUL:",
-		soulPrompt,
+		"Persona prompt (SOUL + optional sub personality):",
+		personaPrompt,
 		"",
 		"Variable types:",
 		string(varsJSON),

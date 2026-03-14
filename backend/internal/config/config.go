@@ -17,6 +17,11 @@ type Config struct {
 	BehaviorPath   string
 	AgentsDir      string
 	ContextLimit   int
+	Persona        struct {
+		GroupsDir        string
+		UsersDir         string
+		MaxMarkdownBytes int
+	}
 
 	Telegram struct {
 		APIID       int
@@ -69,6 +74,9 @@ func LoadForApp() (Config, error) {
 		AgentsDir:      getString("AGENTS_DIR", "./agents"),
 		ContextLimit:   getPositiveInt("AI_CONTEXT_MESSAGE_LIMIT", fixedContextLimit),
 	}
+	cfg.Persona.GroupsDir = getString("PERSONA_GROUPS_DIR", "./personality/groups")
+	cfg.Persona.UsersDir = getString("PERSONA_USERS_DIR", "./personality/users")
+	cfg.Persona.MaxMarkdownBytes = getPositiveInt("PERSONA_MAX_MARKDOWN_BYTES", 16000)
 
 	var err error
 	cfg.Telegram.APIID, err = getIntRequired("TG_API_ID")

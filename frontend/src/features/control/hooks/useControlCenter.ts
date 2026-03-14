@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useRouterState } from '@tanstack/react-router'
 import { apiRequest } from '@/features/control/api'
 import {
@@ -7,29 +8,47 @@ import {
 } from '@/features/control/constants'
 import { useBehaviorPolicyEditor } from '@/features/control/hooks/useBehaviorPolicyEditor'
 import { useManualConversationNotifications } from '@/features/control/hooks/useManualConversationNotifications'
+import {
+  controlQueryKeys,
+  fetchAdminSession,
+  fetchAgents,
+  fetchAuthStatus,
+  fetchBehaviorRuntime,
+  fetchConversationMessages,
+  fetchConversations,
+  fetchLogs,
+  fetchPersonaGroupMembers,
+  fetchPersonaGroups,
+  fetchPersonaResolve,
+  fetchPersonaUsers,
+  fetchServiceStatus,
+  fetchSettings,
+  fetchSoul,
+  fetchVariables,
+} from '@/features/control/queries'
 import { formatCurrentPageLabel, readRouteState } from '@/features/control/routeState'
 import {
   normalizeBehaviorPolicy,
   normalizePhoneWithPlus,
   parseAllowUsersInput,
   readInitialPhone,
-  normalizeSettings,
 } from '@/features/control/utils'
 import type {
   AdminSession,
   AgentDefinition,
   AuthStatus,
   BehaviorResponse,
-  BehaviorRuntimeResponse,
   ConfirmDialogState,
   ConversationMessage,
-  ConversationsResponse,
   ConversationStreamEvent,
   ConversationSummary,
-  ConversationMessagesResponse,
   LogEntry,
   LoginResponse,
   MainPage,
+  PersonaGroup,
+  PersonaGroupMember,
+  PersonaResolveResponse,
+  PersonaUserProfile,
   ServiceStatus,
   SettingsPage,
   SettingsResponse,
@@ -39,8 +58,8 @@ import type {
 
 export function useControlCenter() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
-  const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
 
@@ -91,6 +110,16 @@ export function useControlCenter() {
 
   const [variables, setVariables] = useState<VariableValue[]>([])
   const [variableForm, setVariableForm] = useState<VariableValue>({ key: '', type: 'text', value: '' })
+  const [personaGroups, setPersonaGroups] = useState<PersonaGroup[]>([])
+  const [selectedPersonaGroupId, setSelectedPersonaGroupId] = useState('')
+  const [personaGroupMembers, setPersonaGroupMembers] = useState<PersonaGroupMember[]>([])
+  const [personaGroupForm, setPersonaGroupForm] = useState({ id: '', name: '', slug: '', description: '', markdown: '' })
+  const [personaMemberUserId, setPersonaMemberUserId] = useState('')
+  const [personaMemberUsername, setPersonaMemberUsername] = useState('')
+  const [personaUsers, setPersonaUsers] = useState<PersonaUserProfile[]>([])
+  const [selectedPersonaUserId, setSelectedPersonaUserId] = useState('')
+  const [personaUserForm, setPersonaUserForm] = useState({ id: '', label: '', userId: '', username: '', enabled: true, markdown: '' })
+  const [resolvedPersona, setResolvedPersona] = useState<PersonaResolveResponse | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState>({
     open: false,
     title: 'Please Confirm',
@@ -124,9 +153,96 @@ export function useControlCenter() {
     updateBehaviorTriggerKeywordsInput,
   } = useBehaviorPolicyEditor()
 
+  const adminSessionQuery = useQuery({
+    queryKey: controlQueryKeys.adminSession(),
+    queryFn: fetchAdminSession,
+    retry: false,
+  })
+  const secondaryQueriesEnabled = adminSessionQuery.data?.authenticated === true
   const { activePage, activeSettingsPage } = useMemo(
     () => readRouteState(pathname),
     [pathname],
+  )
+  const isSettingsPage = activePage === 'settings'
+  const needsSoulData = isSettingsPage && activeSettingsPage === 'soul'
+  const needsBehaviorData = isSettingsPage && activeSettingsPage === 'behavior'
+  const needsVariablesData = activePage === 'agents' || (isSettingsPage && activeSettingsPage === 'variables')
+  const needsAgentsData = activePage === 'agents'
+  const needsLogsData = activePage === 'logs'
+  const needsPersonaGroupsData = isSettingsPage && activeSettingsPage === 'persona-groups'
+  const needsPersonaUsersData = isSettingsPage && activeSettingsPage === 'persona-users'
+  const selectedChatUserID = useMemo(
+    () => (selectedChatId.startsWith('user:') ? selectedChatId.slice('user:'.length).trim() : ''),
+    [selectedChatId],
+  )
+  const authStatusQuery = useQuery({
+    queryKey: controlQueryKeys.authStatus(),
+    queryFn: fetchAuthStatus,
+    enabled: secondaryQueriesEnabled,
+  })
+  const serviceStatusQuery = useQuery({
+    queryKey: controlQueryKeys.serviceStatus(),
+    queryFn: fetchServiceStatus,
+    enabled: secondaryQueriesEnabled,
+  })
+  const settingsQuery = useQuery({
+    queryKey: controlQueryKeys.settings(),
+    queryFn: fetchSettings,
+    enabled: secondaryQueriesEnabled,
+  })
+  const soulQuery = useQuery({
+    queryKey: controlQueryKeys.soul(),
+    queryFn: fetchSoul,
+    enabled: secondaryQueriesEnabled && needsSoulData,
+  })
+  const logsQuery = useQuery({
+    queryKey: controlQueryKeys.logs(),
+    queryFn: fetchLogs,
+    enabled: secondaryQueriesEnabled && needsLogsData,
+  })
+  const agentsQuery = useQuery({
+    queryKey: controlQueryKeys.agents(),
+    queryFn: fetchAgents,
+    enabled: secondaryQueriesEnabled && needsAgentsData,
+  })
+  const variablesQuery = useQuery({
+    queryKey: controlQueryKeys.variables(),
+    queryFn: fetchVariables,
+    enabled: secondaryQueriesEnabled && needsVariablesData,
+  })
+  const behaviorRuntimeQuery = useQuery({
+    queryKey: controlQueryKeys.behaviorRuntime(),
+    queryFn: fetchBehaviorRuntime,
+    enabled: secondaryQueriesEnabled && needsBehaviorData,
+  })
+  const conversationsQuery = useQuery({
+    queryKey: controlQueryKeys.conversations(),
+    queryFn: fetchConversations,
+    enabled: secondaryQueriesEnabled,
+  })
+  const personaGroupsQuery = useQuery({
+    queryKey: controlQueryKeys.personaGroups(),
+    queryFn: fetchPersonaGroups,
+    enabled: secondaryQueriesEnabled && needsPersonaGroupsData,
+  })
+  const personaUsersQuery = useQuery({
+    queryKey: controlQueryKeys.personaUsers(),
+    queryFn: fetchPersonaUsers,
+    enabled: secondaryQueriesEnabled && needsPersonaUsersData,
+  })
+  const personaResolveQuery = useQuery({
+    queryKey: controlQueryKeys.personaResolve(selectedChatId, selectedChatUserID, ''),
+    queryFn: () => fetchPersonaResolve(selectedChatId, selectedChatUserID, ''),
+    enabled: secondaryQueriesEnabled && activePage === 'dashboard' && !!selectedChatId,
+    staleTime: 5000,
+  })
+
+  const loading = adminSessionQuery.isLoading || (
+    secondaryQueriesEnabled &&
+    (
+      authStatusQuery.isLoading ||
+      settingsQuery.isLoading
+    )
   )
 
   const settingsValues = settings && settings.values && typeof settings.values === 'object' ? settings.values : {}
@@ -172,8 +288,157 @@ export function useControlCenter() {
     onSetMessage: setMessage,
   })
 
+  useEffect(() => {
+    if (adminSessionQuery.data) {
+      setAdminSession(adminSessionQuery.data)
+      if (adminSessionQuery.data.username && !newAdminUsername.trim()) {
+        setNewAdminUsername(adminSessionQuery.data.username)
+      }
+    }
+  }, [adminSessionQuery.data, newAdminUsername])
+
+  useEffect(() => {
+    if (authStatusQuery.data) {
+      setAuthStatus(authStatusQuery.data)
+    }
+  }, [authStatusQuery.data])
+
+  useEffect(() => {
+    if (serviceStatusQuery.data) {
+      setServiceStatus(serviceStatusQuery.data)
+    }
+  }, [serviceStatusQuery.data])
+
+  useEffect(() => {
+    if (settingsQuery.data) {
+      setSettings(settingsQuery.data)
+      setSavedSettings(settingsQuery.data)
+    }
+  }, [settingsQuery.data])
+
+  useEffect(() => {
+    if (soulQuery.data) {
+      setSoulText(soulQuery.data.content || '')
+      setSoulLoadedAt(new Date().toISOString())
+    }
+  }, [soulQuery.data])
+
+  useEffect(() => {
+    if (logsQuery.data) {
+      setLogs(logsQuery.data)
+    }
+  }, [logsQuery.data])
+
+  useEffect(() => {
+    if (agentsQuery.data) {
+      setAgents(agentsQuery.data)
+    }
+  }, [agentsQuery.data])
+
+  useEffect(() => {
+    if (variablesQuery.data) {
+      setVariables(variablesQuery.data)
+    }
+  }, [variablesQuery.data])
+
+  useEffect(() => {
+    if (personaGroupsQuery.data) {
+      const next = personaGroupsQuery.data || []
+      setPersonaGroups(next)
+      setSelectedPersonaGroupId((prev) => {
+        if (prev && next.some((group) => group.id === prev)) {
+          return prev
+        }
+        return next[0]?.id || ''
+      })
+    }
+  }, [personaGroupsQuery.data])
+
+  useEffect(() => {
+    if (personaUsersQuery.data) {
+      const next = personaUsersQuery.data || []
+      setPersonaUsers(next)
+      setSelectedPersonaUserId((prev) => {
+        if (prev && next.some((user) => user.id === prev)) {
+          return prev
+        }
+        return next[0]?.id || ''
+      })
+    }
+  }, [personaUsersQuery.data])
+
+  useEffect(() => {
+    if (personaResolveQuery.data) {
+      setResolvedPersona(personaResolveQuery.data)
+    } else {
+      setResolvedPersona(null)
+    }
+  }, [personaResolveQuery.data])
+
+  useEffect(() => {
+    if (behaviorRuntimeQuery.data) {
+      syncBehaviorPolicyState(behaviorRuntimeQuery.data.policy, {
+        loadedAt: behaviorRuntimeQuery.data.loadedAt,
+        path: behaviorRuntimeQuery.data.path,
+        states: behaviorRuntimeQuery.data.states || [],
+      })
+    }
+  }, [behaviorRuntimeQuery.data, syncBehaviorPolicyState])
+
+  useEffect(() => {
+    if (conversationsQuery.data) {
+      setGlobalAutoReplyEnabled(conversationsQuery.data.globalAutoReplyEnabled)
+      setConversations(conversationsQuery.data.conversations || [])
+      setSelectedChatId((prev) => {
+        if (prev && (conversationsQuery.data?.conversations || []).some((c) => c.chatId === prev)) {
+          return prev
+        }
+        return (conversationsQuery.data?.conversations || [])[0]?.chatId || ''
+      })
+    }
+  }, [conversationsQuery.data])
+
+  useEffect(() => {
+    const queryErrors = [
+      adminSessionQuery.error,
+      authStatusQuery.error,
+      serviceStatusQuery.error,
+      settingsQuery.error,
+      soulQuery.error,
+      logsQuery.error,
+      agentsQuery.error,
+      variablesQuery.error,
+      behaviorRuntimeQuery.error,
+      conversationsQuery.error,
+      personaGroupsQuery.error,
+      personaUsersQuery.error,
+      personaResolveQuery.error,
+    ]
+    const firstError = queryErrors.find(Boolean)
+    if (firstError) {
+      handleRequestError(firstError)
+    }
+  }, [
+    adminSessionQuery.error,
+    authStatusQuery.error,
+    serviceStatusQuery.error,
+    settingsQuery.error,
+    soulQuery.error,
+    logsQuery.error,
+    agentsQuery.error,
+    variablesQuery.error,
+    behaviorRuntimeQuery.error,
+    conversationsQuery.error,
+    personaGroupsQuery.error,
+    personaUsersQuery.error,
+    personaResolveQuery.error,
+  ])
+
   const refreshConversations = async () => {
-    const convPayload = await apiRequest<ConversationsResponse>('/api/conversations?limit=200')
+    const convPayload = await queryClient.fetchQuery({
+      queryKey: controlQueryKeys.conversations(),
+      queryFn: fetchConversations,
+    })
     setGlobalAutoReplyEnabled(convPayload.globalAutoReplyEnabled)
     setConversations(convPayload.conversations || [])
     setSelectedChatId((prev) => {
@@ -181,6 +446,69 @@ export function useControlCenter() {
         return prev
       }
       return (convPayload.conversations || [])[0]?.chatId || ''
+    })
+  }
+
+  const refreshPersonaGroups = async () => {
+    const groups = await queryClient.fetchQuery({
+      queryKey: controlQueryKeys.personaGroups(),
+      queryFn: fetchPersonaGroups,
+    })
+    setPersonaGroups(groups || [])
+    return groups || []
+  }
+
+  const refreshPersonaUsers = async () => {
+    const users = await queryClient.fetchQuery({
+      queryKey: controlQueryKeys.personaUsers(),
+      queryFn: fetchPersonaUsers,
+    })
+    setPersonaUsers(users || [])
+    return users || []
+  }
+
+  const loadPersonaGroupMembers = async (groupId: string) => {
+    if (!groupId) {
+      setPersonaGroupMembers([])
+      return
+    }
+    const members = await queryClient.fetchQuery({
+      queryKey: controlQueryKeys.personaGroupMembers(groupId),
+      queryFn: () => fetchPersonaGroupMembers(groupId),
+    })
+    setPersonaGroupMembers(members || [])
+  }
+
+  const loadPersonaGroupDetail = async (groupId: string) => {
+    if (!groupId) {
+      setPersonaGroupForm({ id: '', name: '', slug: '', description: '', markdown: '' })
+      setPersonaGroupMembers([])
+      return
+    }
+    const payload = await apiRequest<{ group: PersonaGroup; content?: string }>(`/api/persona/groups/${encodeURIComponent(groupId)}`)
+    setPersonaGroupForm({
+      id: payload.group.id,
+      name: payload.group.name || '',
+      slug: payload.group.slug || '',
+      description: payload.group.description || '',
+      markdown: payload.content || '',
+    })
+    await loadPersonaGroupMembers(groupId)
+  }
+
+  const loadPersonaUserDetail = async (userProfileID: string) => {
+    if (!userProfileID) {
+      setPersonaUserForm({ id: '', label: '', userId: '', username: '', enabled: true, markdown: '' })
+      return
+    }
+    const payload = await apiRequest<{ user: PersonaUserProfile; content?: string }>(`/api/persona/users/${encodeURIComponent(userProfileID)}`)
+    setPersonaUserForm({
+      id: payload.user.id,
+      label: payload.user.label || '',
+      userId: payload.user.userId || '',
+      username: payload.user.username || '',
+      enabled: payload.user.enabled,
+      markdown: payload.content || '',
     })
   }
 
@@ -225,55 +553,12 @@ export function useControlCenter() {
   }
 
   const refreshState = async () => {
-    setLoading(true)
     try {
-      const admin = await apiRequest<AdminSession>('/api/admin/me')
-      setAdminSession(admin)
-      if (admin.username && !newAdminUsername.trim()) {
-        setNewAdminUsername(admin.username)
-      }
-
-      if (!admin.authenticated) {
-        setLoading(false)
-        return
-      }
-
-      const [auth, service, settingsData, soul, logPayload, agentsPayload, varsPayload, behaviorRuntime] = await Promise.all([
-        apiRequest<AuthStatus>('/api/auth/status'),
-        apiRequest<ServiceStatus>('/api/service/status'),
-        apiRequest<SettingsResponse>('/api/settings'),
-        apiRequest<{ content: string }>('/api/soul'),
-        apiRequest<{ logs: LogEntry[] }>('/api/logs?limit=200'),
-        apiRequest<{ agents: AgentDefinition[] }>('/api/agents'),
-        apiRequest<{ values: VariableValue[] }>('/api/variables'),
-        apiRequest<BehaviorRuntimeResponse>('/api/behavior/runtime'),
-      ])
-      setAuthStatus(auth)
-      setServiceStatus(service)
-      const normalizedSettings = normalizeSettings(settingsData)
-      setSettings(normalizedSettings)
-      setSavedSettings(normalizedSettings)
-      setSoulText(soul.content || '')
-      setSoulLoadedAt(new Date().toISOString())
-      setLogs(logPayload.logs || [])
-      setAgents(agentsPayload.agents || [])
-      setVariables(varsPayload.values || [])
-      syncBehaviorPolicyState(behaviorRuntime.policy, {
-        loadedAt: behaviorRuntime.loadedAt,
-        path: behaviorRuntime.path,
-        states: behaviorRuntime.states || [],
-      })
-      await refreshConversations()
+      await queryClient.invalidateQueries({ queryKey: controlQueryKeys.base })
     } catch (err) {
       handleRequestError(err)
-    } finally {
-      setLoading(false)
     }
   }
-
-  useEffect(() => {
-    void refreshState()
-  }, [])
 
   useEffect(() => {
     conversationsRef.current = conversations
@@ -314,8 +599,14 @@ export function useControlCenter() {
     const eventSource = new EventSource(`${API_BASE}/api/logs/stream`, { withCredentials: true })
     eventSource.addEventListener('log', (event) => {
       const parsed = JSON.parse((event as MessageEvent).data) as LogEntry
-      setLogs((prev) => {
-        const next = [...prev, parsed]
+      queryClient.setQueryData(controlQueryKeys.logs(), (prev: LogEntry[] | undefined) => {
+        const current = prev || []
+        setLogs((state) => {
+          const next = [...state, parsed]
+          if (next.length > 400) return next.slice(next.length - 400)
+          return next
+        })
+        const next = [...current, parsed]
         if (next.length > 400) return next.slice(next.length - 400)
         return next
       })
@@ -351,11 +642,33 @@ export function useControlCenter() {
     if (!adminSession.authenticated) {
       return
     }
+    if (!selectedPersonaGroupId) {
+      void loadPersonaGroupDetail('').catch(handleRequestError)
+      return
+    }
+    void loadPersonaGroupDetail(selectedPersonaGroupId).catch(handleRequestError)
+  }, [adminSession.authenticated, selectedPersonaGroupId])
+
+  useEffect(() => {
+    if (!adminSession.authenticated) {
+      return
+    }
+    if (!selectedPersonaUserId) {
+      void loadPersonaUserDetail('').catch(handleRequestError)
+      return
+    }
+    void loadPersonaUserDetail(selectedPersonaUserId).catch(handleRequestError)
+  }, [adminSession.authenticated, selectedPersonaUserId])
+
+  useEffect(() => {
+    if (!adminSession.authenticated) {
+      return
+    }
     const connectedAt = Date.now()
     const eventSource = new EventSource(`${API_BASE}/api/conversations/stream`, { withCredentials: true })
     eventSource.addEventListener('conversation', (event) => {
       let parsed: ConversationStreamEvent | null = null
-      void refreshConversations()
+      void queryClient.invalidateQueries({ queryKey: controlQueryKeys.conversations() })
       try {
         parsed = JSON.parse((event as MessageEvent).data) as ConversationStreamEvent
         if (parsed.type === 'message_created') {
@@ -710,10 +1023,153 @@ export function useControlCenter() {
     setVariableForm({ key: '', type: 'text', value: '' })
   }
 
+  const savePersonaGroup = async () => {
+    if (!personaGroupForm.name.trim()) {
+      setMessage('Persona group name is required.')
+      return
+    }
+    setBusy(true)
+    setMessage('')
+    try {
+      const payload = {
+        id: personaGroupForm.id.trim(),
+        name: personaGroupForm.name.trim(),
+        slug: personaGroupForm.slug.trim(),
+        description: personaGroupForm.description.trim(),
+        markdown: personaGroupForm.markdown,
+      }
+      const result = await apiRequest<{ group: PersonaGroup }>(
+        personaGroupForm.id ? `/api/persona/groups/${encodeURIComponent(personaGroupForm.id)}` : '/api/persona/groups',
+        {
+          method: personaGroupForm.id ? 'PUT' : 'POST',
+          body: JSON.stringify(payload),
+        },
+      )
+      await refreshPersonaGroups()
+      setSelectedPersonaGroupId(result.group.id)
+      setMessage(personaGroupForm.id ? 'Persona group updated.' : 'Persona group created.')
+    } catch (err) {
+      handleRequestError(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const deletePersonaGroup = async (groupId: string) => {
+    await runConfirmedAction(
+      'Delete selected persona group?',
+      () => apiRequest(`/api/persona/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' }).then(() => undefined),
+      'Persona group deleted.',
+      { title: 'Delete Persona Group', confirmLabel: 'Delete', confirmVariant: 'destructive' },
+    )
+    const groups = await refreshPersonaGroups()
+    if (!groups.some((item) => item.id === selectedPersonaGroupId)) {
+      setSelectedPersonaGroupId(groups[0]?.id || '')
+    }
+  }
+
+  const addPersonaGroupMember = async () => {
+    if (!selectedPersonaGroupId) {
+      setMessage('Select a persona group first.')
+      return
+    }
+    const userId = personaMemberUserId.trim()
+    const username = personaMemberUsername.trim()
+    if (!userId && !username) {
+      setMessage('Member requires userId or username.')
+      return
+    }
+    await runAction(
+      () =>
+        apiRequest(`/api/persona/groups/${encodeURIComponent(selectedPersonaGroupId)}/members`, {
+          method: 'POST',
+          body: JSON.stringify({ userId, username }),
+        }).then(() => undefined),
+      'Persona group member added.',
+    )
+    setPersonaMemberUserId('')
+    setPersonaMemberUsername('')
+    await loadPersonaGroupMembers(selectedPersonaGroupId)
+    await refreshPersonaGroups()
+  }
+
+  const deletePersonaGroupMember = async (memberID: number) => {
+    if (!selectedPersonaGroupId) {
+      return
+    }
+    await runAction(
+      () =>
+        apiRequest(`/api/persona/groups/${encodeURIComponent(selectedPersonaGroupId)}/members/${memberID}`, {
+          method: 'DELETE',
+        }).then(() => undefined),
+      'Persona group member removed.',
+    )
+    await loadPersonaGroupMembers(selectedPersonaGroupId)
+    await refreshPersonaGroups()
+  }
+
+  const savePersonaUser = async () => {
+    if (!personaUserForm.label.trim()) {
+      setMessage('Persona user label is required.')
+      return
+    }
+    if (!personaUserForm.userId.trim() && !personaUserForm.username.trim()) {
+      setMessage('Persona user requires userId or username.')
+      return
+    }
+    setBusy(true)
+    setMessage('')
+    try {
+      const payload = {
+        id: personaUserForm.id.trim(),
+        label: personaUserForm.label.trim(),
+        userId: personaUserForm.userId.trim(),
+        username: personaUserForm.username.trim(),
+        enabled: personaUserForm.enabled,
+        markdown: personaUserForm.markdown,
+      }
+      const result = await apiRequest<{ user: PersonaUserProfile }>(
+        personaUserForm.id ? `/api/persona/users/${encodeURIComponent(personaUserForm.id)}` : '/api/persona/users',
+        {
+          method: personaUserForm.id ? 'PUT' : 'POST',
+          body: JSON.stringify(payload),
+        },
+      )
+      setPersonaUsers((prev) => {
+        const next = [result.user, ...prev.filter((item) => item.id !== result.user.id)]
+        queryClient.setQueryData(controlQueryKeys.personaUsers(), next)
+        return next
+      })
+      setSelectedPersonaUserId(result.user.id)
+      setMessage(personaUserForm.id ? 'Persona user updated.' : 'Persona user created.')
+      void refreshPersonaUsers()
+    } catch (err) {
+      handleRequestError(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const deletePersonaUser = async (id: string) => {
+    await runConfirmedAction(
+      'Delete selected persona user profile?',
+      () => apiRequest(`/api/persona/users/${encodeURIComponent(id)}`, { method: 'DELETE' }).then(() => undefined),
+      'Persona user deleted.',
+      { title: 'Delete Persona User', confirmLabel: 'Delete', confirmVariant: 'destructive' },
+    )
+    const users = await refreshPersonaUsers()
+    if (!users.some((item) => item.id === selectedPersonaUserId)) {
+      setSelectedPersonaUserId(users[0]?.id || '')
+    }
+  }
+
   const loadConversationMessages = async (chatId: string) => {
     if (!chatId) return
     try {
-      const payload = await apiRequest<ConversationMessagesResponse>(`/api/conversations/${encodeURIComponent(chatId)}/messages?limit=100`)
+      const payload = await queryClient.fetchQuery({
+        queryKey: controlQueryKeys.conversationMessages(chatId),
+        queryFn: () => fetchConversationMessages(chatId),
+      })
       setMessagesByChat((prev) => {
         const merged = new Map<string, ConversationMessage>()
         for (const item of prev[chatId] || []) {
@@ -985,6 +1441,16 @@ export function useControlCenter() {
     agentForm,
     variables,
     variableForm,
+    personaGroups,
+    selectedPersonaGroupId,
+    personaGroupMembers,
+    personaGroupForm,
+    personaMemberUserId,
+    personaMemberUsername,
+    personaUsers,
+    selectedPersonaUserId,
+    personaUserForm,
+    resolvedPersona,
     confirmDialog,
     mobileNavOpen,
     notificationPermission,
@@ -1018,6 +1484,12 @@ export function useControlCenter() {
     setAllowUsersInput,
     setAgentForm,
     setVariableForm,
+    setSelectedPersonaGroupId,
+    setPersonaGroupForm,
+    setPersonaMemberUserId,
+    setPersonaMemberUsername,
+    setSelectedPersonaUserId,
+    setPersonaUserForm,
     setSoulText,
     setBehaviorPolicy,
     setMobileNavOpen,
@@ -1048,6 +1520,12 @@ export function useControlCenter() {
     sendManualReply,
     saveVariable,
     deleteVariable,
+    savePersonaGroup,
+    deletePersonaGroup,
+    addPersonaGroupMember,
+    deletePersonaGroupMember,
+    savePersonaUser,
+    deletePersonaUser,
     logoutTelegram,
     openPage,
     openSettingsPage,

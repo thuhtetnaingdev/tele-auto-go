@@ -1,4 +1,4 @@
-import { Bot, Database, LayoutDashboard, Settings2, ShieldCheck, SlidersHorizontal, Terminal, UserCircle2, WandSparkles } from 'lucide-react'
+import { Bot, Database, LayoutDashboard, Settings2, ShieldCheck, SlidersHorizontal, Terminal, UserCircle2, Users, WandSparkles } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import type { MainPage, SettingsPage } from '@/features/control/types'
@@ -66,6 +66,12 @@ export function NavigationMenu({ activePage, activeSettingsPage, onOpenPage, onO
             </Button>
             <Button size="sm" variant={activeSettingsPage === 'user' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => onOpenSettingsPage('user')}>
               <UserCircle2 className="size-4" /> User
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'persona-groups' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => onOpenSettingsPage('persona-groups')}>
+              <Users className="size-4" /> Persona Groups
+            </Button>
+            <Button size="sm" variant={activeSettingsPage === 'persona-users' ? 'secondary' : 'ghost'} className="w-full justify-start" onClick={() => onOpenSettingsPage('persona-users')}>
+              <UserCircle2 className="size-4" /> Persona Users
             </Button>
           </div>
         ) : null}

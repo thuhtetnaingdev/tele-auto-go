@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 
 import {
   defaultBehaviorPolicy,
@@ -20,7 +20,7 @@ export function useBehaviorPolicyEditor() {
   const [behaviorDenyTonesInput, setBehaviorDenyTonesInput] = useState('')
   const [behaviorTriggerKeywordsInput, setBehaviorTriggerKeywordsInput] = useState('')
 
-  const syncBehaviorPolicyState = (nextPolicy: BehaviorPolicy, meta?: { loadedAt?: string; path?: string; states?: BehaviorRuntimeState[] }) => {
+  const syncBehaviorPolicyState = useCallback((nextPolicy: BehaviorPolicy, meta?: { loadedAt?: string; path?: string; states?: BehaviorRuntimeState[] }) => {
     const normalized = normalizeBehaviorPolicy(nextPolicy)
     setBehaviorPolicy(normalized)
     setBehaviorQuietHoursInput(formatQuietHoursInput(normalized.quietHours))
@@ -36,39 +36,39 @@ export function useBehaviorPolicyEditor() {
     if (meta?.states !== undefined) {
       setBehaviorRuntimeStates(meta.states)
     }
-  }
+  }, [])
 
-  const updateBehaviorQuietHoursInput = (value: string) => {
+  const updateBehaviorQuietHoursInput = useCallback((value: string) => {
     setBehaviorQuietHoursInput(value)
     setBehaviorPolicy((prev) => ({
       ...prev,
       quietHours: parseQuietHoursInput(value),
     }))
-  }
+  }, [])
 
-  const updateBehaviorAllowTonesInput = (value: string) => {
+  const updateBehaviorAllowTonesInput = useCallback((value: string) => {
     setBehaviorAllowTonesInput(value)
     setBehaviorPolicy((prev) => ({
       ...prev,
       toneRules: { ...prev.toneRules, allow: parseTextList(value) },
     }))
-  }
+  }, [])
 
-  const updateBehaviorDenyTonesInput = (value: string) => {
+  const updateBehaviorDenyTonesInput = useCallback((value: string) => {
     setBehaviorDenyTonesInput(value)
     setBehaviorPolicy((prev) => ({
       ...prev,
       toneRules: { ...prev.toneRules, deny: parseTextList(value) },
     }))
-  }
+  }, [])
 
-  const updateBehaviorTriggerKeywordsInput = (value: string) => {
+  const updateBehaviorTriggerKeywordsInput = useCallback((value: string) => {
     setBehaviorTriggerKeywordsInput(value)
     setBehaviorPolicy((prev) => ({
       ...prev,
       escalation: { ...prev.escalation, triggerKeywords: parseTextList(value) },
     }))
-  }
+  }, [])
 
   return {
     behaviorPolicy,

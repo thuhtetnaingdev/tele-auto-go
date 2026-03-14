@@ -87,6 +87,16 @@ export default function App() {
     agentForm,
     variables,
     variableForm,
+    personaGroups,
+    selectedPersonaGroupId,
+    personaGroupMembers,
+    personaGroupForm,
+    personaMemberUserId,
+    personaMemberUsername,
+    personaUsers,
+    selectedPersonaUserId,
+    personaUserForm,
+    resolvedPersona,
     confirmDialog,
     mobileNavOpen,
     notificationPermission,
@@ -120,6 +130,12 @@ export default function App() {
     setAllowUsersInput,
     setAgentForm,
     setVariableForm,
+    setSelectedPersonaGroupId,
+    setPersonaGroupForm,
+    setPersonaMemberUserId,
+    setPersonaMemberUsername,
+    setSelectedPersonaUserId,
+    setPersonaUserForm,
     setSoulText,
     setBehaviorPolicy,
     setMobileNavOpen,
@@ -149,6 +165,12 @@ export default function App() {
     sendManualReply,
     saveVariable,
     deleteVariable,
+    savePersonaGroup,
+    deletePersonaGroup,
+    addPersonaGroupMember,
+    deletePersonaGroupMember,
+    savePersonaUser,
+    deletePersonaUser,
     logoutTelegram,
     openPage,
     openSettingsPage,
@@ -515,6 +537,7 @@ export default function App() {
                         manualReplyText={manualReplyText}
                         onManualReplyTextChange={setManualReplyText}
                         onSendManualReply={sendManualReply}
+                        resolvedPersona={resolvedPersona?.resolved}
                       />
                     </section>
                   ) : null}
@@ -581,6 +604,27 @@ export default function App() {
                     onSaveVariable={saveVariable}
                     variables={variables}
                     onDeleteVariable={deleteVariable}
+                    personaGroups={personaGroups}
+                    selectedPersonaGroupId={selectedPersonaGroupId}
+                    onSelectPersonaGroupId={setSelectedPersonaGroupId}
+                    personaGroupMembers={personaGroupMembers}
+                    personaGroupForm={personaGroupForm}
+                    onPersonaGroupFormChange={setPersonaGroupForm}
+                    onSavePersonaGroup={savePersonaGroup}
+                    onDeletePersonaGroup={deletePersonaGroup}
+                    personaMemberUserId={personaMemberUserId}
+                    onPersonaMemberUserIdChange={setPersonaMemberUserId}
+                    personaMemberUsername={personaMemberUsername}
+                    onPersonaMemberUsernameChange={setPersonaMemberUsername}
+                    onAddPersonaGroupMember={addPersonaGroupMember}
+                    onDeletePersonaGroupMember={deletePersonaGroupMember}
+                    personaUsers={personaUsers}
+                    selectedPersonaUserId={selectedPersonaUserId}
+                    onSelectPersonaUserId={setSelectedPersonaUserId}
+                    personaUserForm={personaUserForm}
+                    onPersonaUserFormChange={setPersonaUserForm}
+                    onSavePersonaUser={savePersonaUser}
+                    onDeletePersonaUser={deletePersonaUser}
                     currentAdminPassword={currentAdminPassword}
                     newAdminUsername={newAdminUsername}
                     newAdminPassword={newAdminPassword}
